@@ -2,6 +2,10 @@
 
 A self-hosted web server that downloads YouTube videos as MP3 audio or MP4 video files. Features a modern dark-mode UI, real-time progress tracking, and download history.
 
+| Audio | Video | History |
+|-------|-------|---------|
+| ![Audio](assets/audio.png) | ![Video](assets/videos.png) | ![History](assets/history.png) |
+
 ## Features
 
 - **Audio & Video Downloads** - Download as MP3 (audio) or MP4 (video)
