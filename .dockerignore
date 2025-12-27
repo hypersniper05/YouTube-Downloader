@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+
+# Downloads
+downloads/
+
+# Documentation
+README.md
+LICENSE
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.yml
+Dockerfile
+.dockerignore

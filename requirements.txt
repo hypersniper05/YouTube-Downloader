@@ -1,0 +1,9 @@
+# YouTube to MP3 Converter
+# For manual installation (Docker handles this automatically)
+
+yt-dlp>=2024.1.0
+
+# Note: You also need ffmpeg installed on your system
+# Ubuntu/Debian: sudo apt install ffmpeg
+# macOS: brew install ffmpeg
+# Windows: winget install FFmpeg
