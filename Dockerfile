@@ -1,7 +1,7 @@
 # ytdl-web - YouTube Downloader
-# Lightweight Python image with ffmpeg
+# Python + Node.js image (Node.js required by yt-dlp for YouTube JS extraction)
 
-FROM python:3.11-slim
+FROM nikolaik/python-nodejs:python3.11-nodejs22-slim
 
 # Install ffmpeg
 RUN apt-get update && \

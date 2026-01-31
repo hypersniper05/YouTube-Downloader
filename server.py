@@ -1157,6 +1157,7 @@ def get_video_info(url):
         'yt-dlp',
         '--dump-json',
         '--no-playlist',
+        '--js-runtimes', 'nodejs',
         url
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -1210,6 +1211,7 @@ def download_and_convert(task_id, url, bitrate='320'):
             '--no-playlist',
             '--newline',  # Output progress on new lines for parsing
             '--progress',
+            '--js-runtimes', 'nodejs',
         ]
 
         # Add FFmpeg location if available from imageio-ffmpeg
@@ -1309,6 +1311,7 @@ def download_video(task_id, url, resolution='1080'):
             '--no-playlist',
             '--newline',  # Output progress on new lines for parsing
             '--progress',
+            '--js-runtimes', 'nodejs',
         ]
 
         # Add FFmpeg location if available
