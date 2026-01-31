@@ -1232,9 +1232,13 @@ def download_and_convert(task_id, url, bitrate='320'):
         )
 
         # Read output line by line for real-time progress
+        last_lines = []
         for line in iter(process.stdout.readline, ''):
             if not line:
                 break
+            last_lines.append(line.strip())
+            if len(last_lines) > 15:
+                last_lines.pop(0)
             progress = parse_progress(line)
             if progress is not None:
                 with downloads_lock:
@@ -1247,7 +1251,8 @@ def download_and_convert(task_id, url, bitrate='320'):
         process.wait(timeout=300)
 
         if process.returncode != 0:
-            raise Exception("yt-dlp download failed")
+            error_detail = '\n'.join(last_lines[-5:]) if last_lines else 'No output captured'
+            raise Exception(f"yt-dlp download failed:\n{error_detail}")
 
         # Find the MP3 file
         mp3_files = list(task_dir.glob('*.mp3'))
@@ -1326,9 +1331,13 @@ def download_video(task_id, url, resolution='1080'):
         )
 
         # Read output line by line for real-time progress
+        last_lines = []
         for line in iter(process.stdout.readline, ''):
             if not line:
                 break
+            last_lines.append(line.strip())
+            if len(last_lines) > 15:
+                last_lines.pop(0)
             progress = parse_progress(line)
             if progress is not None:
                 with downloads_lock:
@@ -1341,7 +1350,8 @@ def download_video(task_id, url, resolution='1080'):
         process.wait(timeout=600)
 
         if process.returncode != 0:
-            raise Exception("yt-dlp download failed")
+            error_detail = '\n'.join(last_lines[-5:]) if last_lines else 'No output captured'
+            raise Exception(f"yt-dlp download failed:\n{error_detail}")
 
         # Find the video file
         video_files = list(task_dir.glob('*.mp4')) + list(task_dir.glob('*.mkv')) + list(task_dir.glob('*.webm'))
