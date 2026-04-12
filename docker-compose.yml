@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   ytdl-web:
     build: .
@@ -9,7 +7,21 @@ services:
     volumes:
       # Persist downloads (optional - remove if you don't need to keep files)
       - ./downloads:/app/downloads
-    restart: unless-stopped
+      # Persist Whisper model cache so it doesn't re-download on container rebuild
+      - whisper-model:/app/whisper-model
+    restart: always
     environment:
       - PYTHONUNBUFFERED=1
       - EXTERNAL_PORT=6080
+      - WHISPER_MODEL_DIR=/app/whisper-model
+    # Enable NVIDIA GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  whisper-model:

@@ -10,6 +10,7 @@ import re
 import sys
 import uuid
 import json
+import gc
 import threading
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -37,6 +38,119 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 # Track active downloads
 active_downloads = {}
 downloads_lock = threading.Lock()
+
+# Whisper transcription state
+WHISPER_MODEL_ID = os.environ.get('WHISPER_MODEL_ID', 'openai/whisper-large-v3-turbo')
+WHISPER_MODEL_DIR = os.environ.get('WHISPER_MODEL_DIR', str(Path(__file__).parent / 'whisper-model'))
+whisper_lock = threading.Lock()  # Serializes transcription (pipeline not thread-safe)
+_whisper_pipe = None
+_whisper_refcount = 0
+_whisper_refcount_lock = threading.Lock()
+
+
+def _load_whisper():
+    """Load the Whisper model on demand. Returns the ASR pipeline."""
+    global _whisper_pipe
+    if _whisper_pipe is not None:
+        return _whisper_pipe
+
+    import torch
+    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    print(f"[Whisper] Loading model {WHISPER_MODEL_ID} on {device}...")
+
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        WHISPER_MODEL_ID,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+        cache_dir=WHISPER_MODEL_DIR,
+    ).to(device)
+    processor = AutoProcessor.from_pretrained(WHISPER_MODEL_ID, cache_dir=WHISPER_MODEL_DIR)
+
+    _whisper_pipe = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=processor.tokenizer,
+        feature_extractor=processor.feature_extractor,
+        dtype=dtype,
+        device=device,
+    )
+    print("[Whisper] Model loaded successfully.")
+    return _whisper_pipe
+
+
+def _unload_whisper():
+    """Unload the Whisper model to free GPU/RAM."""
+    global _whisper_pipe
+    if _whisper_pipe is None:
+        return
+    print("[Whisper] Unloading model to free resources...")
+    del _whisper_pipe
+    _whisper_pipe = None
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    print("[Whisper] Model unloaded.")
+
+
+def whisper_acquire():
+    """Increment ref count - call before starting a transcription task."""
+    global _whisper_refcount
+    with _whisper_refcount_lock:
+        _whisper_refcount += 1
+
+
+def whisper_release():
+    """Decrement ref count and unload model if no more pending work."""
+    global _whisper_refcount
+    with _whisper_refcount_lock:
+        _whisper_refcount = max(0, _whisper_refcount - 1)
+        if _whisper_refcount == 0:
+            _unload_whisper()
+
+
+def _seconds_to_srt_time(s):
+    """Convert seconds to SRT timestamp format HH:MM:SS,mmm."""
+    if s is None:
+        s = 0.0
+    hours = int(s // 3600)
+    minutes = int((s % 3600) // 60)
+    secs = int(s % 60)
+    millis = int((s - int(s)) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def transcribe_audio_file(audio_path, timestamps=False):
+    """Transcribe an audio file using Whisper. Queued via whisper_lock (one at a time).
+    If timestamps=True, returns SRT-formatted string. Otherwise plain text."""
+    with whisper_lock:
+        pipe = _load_whisper()
+        result = pipe(audio_path, return_timestamps=True)
+
+    if not timestamps:
+        return result["text"]
+
+    # Build SRT format from chunks
+    chunks = result.get("chunks", [])
+    if not chunks:
+        return result["text"]
+
+    lines = []
+    for i, chunk in enumerate(chunks, start=1):
+        start, end = chunk["timestamp"]
+        if end is None:
+            end = start + 5.0
+        lines.append(str(i))
+        lines.append(f"{_seconds_to_srt_time(start)} --> {_seconds_to_srt_time(end)}")
+        lines.append(chunk["text"].strip())
+        lines.append("")
+    return "\n".join(lines)
 
 
 def parse_progress(line):
@@ -517,6 +631,17 @@ HTML_PAGE = '''<!DOCTYPE html>
             color: #aaa;
         }
 
+        .badge-processing {
+            background: #ff9800;
+            color: white;
+            animation: pulse-badge 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse-badge {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
         .history-date {
             font-size: 11px;
             color: #717171;
@@ -730,6 +855,22 @@ HTML_PAGE = '''<!DOCTYPE html>
                         <div class="estimated-size" id="estimatedSize"></div>
                     </div>
 
+                    <div class="transcription-option" style="margin: 12px 0; padding: 10px 12px; background: #1a1a1a; border-radius: 8px; border: 1px solid #272727;">
+                        <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none;">
+                            <input type="checkbox" id="enableTranscription" onchange="document.getElementById('timestampOption').style.display = this.checked ? 'flex' : 'none'" style="width: 18px; height: 18px; cursor: pointer; accent-color: #ff0000;">
+                            <div>
+                                <div style="font-size: 14px; color: #f1f1f1;">Extract transcription</div>
+                                <div style="font-size: 11px; color: #717171; margin-top: 2px;">Uses Whisper AI to generate a text file of the spoken content</div>
+                            </div>
+                        </label>
+                        <label id="timestampOption" style="display: none; align-items: center; gap: 10px; cursor: pointer; user-select: none; margin-top: 8px; padding-left: 28px;">
+                            <input type="checkbox" id="enableTimestamps" style="width: 16px; height: 16px; cursor: pointer; accent-color: #ff0000;">
+                            <div>
+                                <div style="font-size: 13px; color: #aaa;">Include timestamps (SRT format)</div>
+                            </div>
+                        </label>
+                    </div>
+
                     <div class="convert-section">
                         <button class="btn btn-convert" id="convertBtn" onclick="convert()">
                             <span id="convertBtnText">Download MP3</span>
@@ -749,6 +890,10 @@ HTML_PAGE = '''<!DOCTYPE html>
                 <a href="#" class="download-btn" id="downloadBtn">
                     <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
                     <span id="downloadText">Download</span>
+                </a>
+                <a href="#" class="download-btn" id="transcriptionBtn" style="display:none; background: #272727; margin-top: 8px; font-size: 13px;">
+                    <svg viewBox="0 0 24 24" style="width:18px;height:18px;"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm-1 9h-2v2H9v-2H7v-2h2V7h2v2h2v2zm-1-8.5L16.5 7H12V2.5z"/></svg>
+                    <span id="transcriptionText">Download Transcription</span>
                 </a>
             </div>
 
@@ -786,10 +931,46 @@ HTML_PAGE = '''<!DOCTYPE html>
         let currentMode = 'audio';
         let currentView = 'download';
 
+        // Track background polling for resumed tasks
+        const backgroundPolls = {};
+
         // Initialize
         setInterval(updateActiveCount, 3000);
         updateActiveCount();
         loadHistory();
+        resumeProcessingTasks();
+
+        function resumeProcessingTasks() {
+            const history = getHistory();
+            history.filter(item => item.status === 'processing').forEach(item => {
+                if (backgroundPolls[item.task_id]) return;
+                backgroundPolls[item.task_id] = setInterval(() => {
+                    fetch('/api/check/' + item.task_id)
+                        .then(r => r.json())
+                        .then(data => {
+                            if (data.status === 'completed') {
+                                clearInterval(backgroundPolls[item.task_id]);
+                                delete backgroundPolls[item.task_id];
+                                addToHistory({
+                                    ...item,
+                                    status: 'completed',
+                                    filename: data.filename,
+                                    download_url: data.download_url,
+                                    transcription_url: data.transcription_url || null,
+                                    transcription_filename: data.transcription_filename || null
+                                });
+                                if (currentView === 'history') loadHistory();
+                            } else if (data.status === 'error' || data.status === 'not_found') {
+                                clearInterval(backgroundPolls[item.task_id]);
+                                delete backgroundPolls[item.task_id];
+                                removeFromHistory(item.task_id);
+                                if (currentView === 'history') loadHistory();
+                            }
+                        })
+                        .catch(() => {});
+                }, 2000);
+            });
+        }
 
         function switchTab(mode) {
             // Handle history tab separately
@@ -938,10 +1119,11 @@ HTML_PAGE = '''<!DOCTYPE html>
                 const exists = existsResults[index];
                 const isMP3 = item.type === 'audio';
                 const qualityLabel = isMP3 ? item.quality + ' kbps' : item.quality + 'p';
+                const isProcessing = item.status === 'processing';
 
                 const youtubeUrl = item.youtube_url || '';
                 html += `
-                    <div class="history-item ${exists ? '' : 'deleted'}">
+                    <div class="history-item ${!isProcessing && !exists ? 'deleted' : ''}">
                         <a href="${youtubeUrl}" target="_blank" rel="noopener" style="flex-shrink:0;">
                             <img class="history-thumb" src="${item.thumbnail || ''}" alt="" style="cursor:pointer;" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 9%22><rect fill=%22%23272727%22 width=%2216%22 height=%229%22/></svg>'">
                         </a>
@@ -952,19 +1134,28 @@ HTML_PAGE = '''<!DOCTYPE html>
                             <div class="history-meta">
                                 <span class="history-badge ${isMP3 ? 'badge-mp3' : 'badge-mp4'}">${isMP3 ? 'MP3' : 'MP4'}</span>
                                 <span class="history-badge badge-quality">${qualityLabel}</span>
+                                ${isProcessing ? '<span class="history-badge badge-processing">Processing...</span>' : ''}
                                 <span class="history-date">${formatDate(item.date)}</span>
                             </div>
-                            ${!exists ? '<div class="deleted-tooltip">File no longer available on server</div>' : ''}
+                            ${!isProcessing && !exists ? '<div class="deleted-tooltip">File no longer available on server</div>' : ''}
                         </div>
                         <div class="history-actions">
+                            ${isProcessing ? '' : `
                             <button class="history-download-btn" ${exists ? '' : 'disabled'}
                                     onclick="${exists ? `window.location.href='${item.download_url}'` : ''}"
                                     title="${exists ? 'Download' : 'File unavailable'}">
                                 <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
                             </button>
+                            ${item.transcription_url ? `<button class="history-download-btn" ${exists ? '' : 'disabled'}
+                                    onclick="${exists ? `window.location.href='${item.transcription_url}'` : ''}"
+                                    title="${exists ? 'Download Transcript' : 'File unavailable'}"
+                                    style="background: #272727; font-size: 11px;">
+                                <svg viewBox="0 0 24 24" style="width:16px;height:16px;fill:currentColor;"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm-1 9h-2v2H9v-2H7v-2h2V7h2v2h2v2zm-1-8.5L16.5 7H12V2.5z"/></svg>
+                            </button>` : ''}
                             <button class="history-delete-btn" onclick="deleteHistoryItem('${item.task_id}')" title="Delete">
                                 <svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
                             </button>
+                            `}
                         </div>
                     </div>
                 `;
@@ -1036,10 +1227,13 @@ HTML_PAGE = '''<!DOCTYPE html>
 
             const endpoint = currentMode === 'audio' ? '/api/convert' : '/api/convert-video';
 
+            const transcribe = document.getElementById('enableTranscription').checked;
+            const timestamps = document.getElementById('enableTimestamps').checked;
+
             fetch(endpoint, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({url: currentUrl, bitrate: quality, resolution: quality})
+                body: JSON.stringify({url: currentUrl, bitrate: quality, resolution: quality, transcribe: transcribe, timestamps: timestamps})
             })
             .then(r => r.json())
             .then(data => {
@@ -1051,7 +1245,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 }
 
                 currentTaskId = data.task_id;
-                // Store current conversion info for history
+                // Save to history immediately so it persists if user leaves
                 window.currentConversion = {
                     task_id: data.task_id,
                     title: currentTitle,
@@ -1059,9 +1253,12 @@ HTML_PAGE = '''<!DOCTYPE html>
                     youtube_url: currentUrl,
                     type: currentMode,
                     quality: quality,
-                    date: Date.now()
+                    date: Date.now(),
+                    status: 'processing'
                 };
+                addToHistory(window.currentConversion);
                 showStatus('Downloading...');
+                document.getElementById('convertBtn').disabled = false;
                 pollInterval = setInterval(checkStatus, 500);
             })
             .catch(err => {
@@ -1082,25 +1279,42 @@ HTML_PAGE = '''<!DOCTYPE html>
                         setProgress(100);
                         showStatus('Complete!');
                         showDownload(data.filename, data.download_url);
-                        document.getElementById('convertBtn').disabled = false;
+                        // Show transcription download if available
+                        if (data.transcription_url) {
+                            const tBtn = document.getElementById('transcriptionBtn');
+                            tBtn.href = data.transcription_url;
+                            tBtn.download = data.transcription_filename || 'transcription.txt';
+                            document.getElementById('transcriptionText').textContent = data.transcription_filename || 'Download Transcription';
+                            tBtn.style.display = 'flex';
+                        } else {
+                            document.getElementById('transcriptionBtn').style.display = 'none';
+                        }
                         updateActiveCount();
 
-                        // Add to history
+                        // Update history entry with completed info
                         if (window.currentConversion) {
                             addToHistory({
                                 ...window.currentConversion,
+                                status: 'completed',
                                 filename: data.filename,
-                                download_url: data.download_url
+                                download_url: data.download_url,
+                                transcription_url: data.transcription_url || null,
+                                transcription_filename: data.transcription_filename || null
                             });
                             window.currentConversion = null;
                         }
+                        if (currentView === 'history') loadHistory();
                     } else if (data.status === 'error') {
                         clearInterval(pollInterval);
                         showError(data.error || 'Download failed');
                         hideStatus();
-                        document.getElementById('convertBtn').disabled = false;
                         updateActiveCount();
-                        window.currentConversion = null;
+                        // Remove failed task from history
+                        if (window.currentConversion) {
+                            removeFromHistory(window.currentConversion.task_id);
+                            window.currentConversion = null;
+                        }
+                        if (currentView === 'history') loadHistory();
                     } else if (data.status === 'processing') {
                         const progress = data.progress || 0;
                         setProgress(Math.min(99, progress));
@@ -1124,7 +1338,10 @@ HTML_PAGE = '''<!DOCTYPE html>
             document.getElementById('downloadBtn').download = filename;
             document.getElementById('downloadText').textContent = filename;
         }
-        function hideDownload() { document.getElementById('downloadSection').classList.remove('show'); }
+        function hideDownload() {
+            document.getElementById('downloadSection').classList.remove('show');
+            document.getElementById('transcriptionBtn').style.display = 'none';
+        }
         function showError(msg) {
             document.getElementById('error').textContent = msg;
             document.getElementById('error').classList.add('show');
@@ -1172,8 +1389,8 @@ def get_video_info(url):
     }
 
 
-def download_and_convert(task_id, url, bitrate='320'):
-    """Download YouTube video and convert to MP3."""
+def download_and_convert(task_id, url, bitrate='320', transcribe=False, timestamps=False):
+    """Download YouTube video and convert to MP3, optionally transcribe."""
     try:
         with downloads_lock:
             active_downloads[task_id] = {
@@ -1264,15 +1481,40 @@ def download_and_convert(task_id, url, bitrate='320'):
         mp3_file = mp3_files[0]
         filename = mp3_file.name
 
+        result = {
+            'status': 'completed',
+            'filename': filename,
+            'filepath': str(mp3_file),
+            'download_url': f'/download/{task_id}/{quote(filename)}'
+        }
+
+        # Transcribe if requested
+        if transcribe:
+            try:
+                with downloads_lock:
+                    active_downloads[task_id]['message'] = 'Transcribing audio with Whisper AI...'
+                    active_downloads[task_id]['progress'] = 98
+
+                text = transcribe_audio_file(str(mp3_file), timestamps=timestamps)
+
+                ext = '.srt' if timestamps else '.txt'
+                transcript_name = mp3_file.stem + ext
+                transcript_path = task_dir / transcript_name
+                transcript_path.write_text(text, encoding='utf-8')
+
+                result['transcription_url'] = f'/download/{task_id}/{quote(transcript_name)}'
+                result['transcription_filename'] = transcript_name
+            except Exception as e:
+                print(f"[Whisper] Transcription failed for task {task_id}: {e}")
+            finally:
+                whisper_release()
+
         with downloads_lock:
-            active_downloads[task_id] = {
-                'status': 'completed',
-                'filename': filename,
-                'filepath': str(mp3_file),
-                'download_url': f'/download/{task_id}/{filename}'
-            }
+            active_downloads[task_id] = result
 
     except Exception as e:
+        if transcribe:
+            whisper_release()
         with downloads_lock:
             active_downloads[task_id] = {
                 'status': 'error',
@@ -1280,7 +1522,7 @@ def download_and_convert(task_id, url, bitrate='320'):
             }
 
 
-def download_video(task_id, url, resolution='1080'):
+def download_video(task_id, url, resolution='1080', transcribe=False, timestamps=False):
     """Download YouTube video as MP4."""
     try:
         with downloads_lock:
@@ -1364,15 +1606,40 @@ def download_video(task_id, url, resolution='1080'):
         video_file = video_files[0]
         filename = video_file.name
 
+        result = {
+            'status': 'completed',
+            'filename': filename,
+            'filepath': str(video_file),
+            'download_url': f'/download/{task_id}/{quote(filename)}'
+        }
+
+        # Transcribe directly from the video file (Whisper/ffmpeg handles extraction)
+        if transcribe:
+            try:
+                with downloads_lock:
+                    active_downloads[task_id]['message'] = 'Transcribing audio with Whisper AI...'
+                    active_downloads[task_id]['progress'] = 98
+
+                text = transcribe_audio_file(str(video_file), timestamps=timestamps)
+
+                ext = '.srt' if timestamps else '.txt'
+                transcript_name = video_file.stem + ext
+                transcript_path = task_dir / transcript_name
+                transcript_path.write_text(text, encoding='utf-8')
+
+                result['transcription_url'] = f'/download/{task_id}/{quote(transcript_name)}'
+                result['transcription_filename'] = transcript_name
+            except Exception as e:
+                print(f"[Whisper] Transcription failed for task {task_id}: {e}")
+            finally:
+                whisper_release()
+
         with downloads_lock:
-            active_downloads[task_id] = {
-                'status': 'completed',
-                'filename': filename,
-                'filepath': str(video_file),
-                'download_url': f'/download/{task_id}/{filename}'
-            }
+            active_downloads[task_id] = result
 
     except Exception as e:
+        if transcribe:
+            whisper_release()
         with downloads_lock:
             active_downloads[task_id] = {
                 'status': 'error',
@@ -1453,6 +1720,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                         '.mp4': 'video/mp4',
                         '.mkv': 'video/x-matroska',
                         '.webm': 'video/webm',
+                        '.txt': 'text/plain; charset=utf-8',
+                        '.srt': 'text/plain; charset=utf-8',
                     }
                     content_type = content_types.get(ext, 'application/octet-stream')
                     self.send_header('Content-Type', content_type)
@@ -1505,6 +1774,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 data = json.loads(body)
                 url = data.get('url', '')
                 bitrate = data.get('bitrate', '320')
+                transcribe = data.get('transcribe', False)
+                timestamps = data.get('timestamps', False)
 
                 # Validate URL
                 video_id = extract_video_id(url)
@@ -1520,10 +1791,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # Create task
                 task_id = str(uuid.uuid4())[:8]
 
+                if transcribe:
+                    whisper_acquire()
+
                 # Start conversion in background thread
                 thread = threading.Thread(
                     target=download_and_convert,
-                    args=(task_id, url, bitrate)
+                    args=(task_id, url, bitrate, transcribe, timestamps)
                 )
                 thread.daemon = True
                 thread.start()
@@ -1542,6 +1816,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 data = json.loads(body)
                 url = data.get('url', '')
                 resolution = data.get('resolution', '1080')
+                transcribe = data.get('transcribe', False)
+                timestamps = data.get('timestamps', False)
 
                 # Validate URL
                 video_id = extract_video_id(url)
@@ -1557,10 +1833,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # Create task
                 task_id = str(uuid.uuid4())[:8]
 
+                if transcribe:
+                    whisper_acquire()
+
                 # Start video download in background thread
                 thread = threading.Thread(
                     target=download_video,
-                    args=(task_id, url, resolution)
+                    args=(task_id, url, resolution, transcribe, timestamps)
                 )
                 thread.daemon = True
                 thread.start()

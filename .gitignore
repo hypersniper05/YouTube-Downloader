@@ -25,5 +25,5 @@ Thumbs.db
 # Logs
 *.log
 
-# Claude-generated files
+# Local config
 .claude/

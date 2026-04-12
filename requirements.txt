@@ -1,9 +1,15 @@
-# YouTube to MP3 Converter
+# YouTube to MP3/MP4 Converter with Whisper Transcription
 # For manual installation (Docker handles this automatically)
 
 yt-dlp>=2024.1.0
+torch
+transformers>=4.40.0
+accelerate
 
 # Note: You also need ffmpeg installed on your system
 # Ubuntu/Debian: sudo apt install ffmpeg
 # macOS: brew install ffmpeg
 # Windows: winget install FFmpeg
+
+# Note: For GPU support, install PyTorch with CUDA:
+# pip install torch --index-url https://download.pytorch.org/whl/cu124
