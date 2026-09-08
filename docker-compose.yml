@@ -14,6 +14,9 @@ services:
       - PYTHONUNBUFFERED=1
       - EXTERNAL_PORT=6080
       - WHISPER_MODEL_DIR=/app/whisper-model
+      # Refresh yt-dlp on every container start. YouTube breaks extraction every few
+      # weeks; this makes `docker compose restart` the fix. Set to 0 to pin to the image.
+      - YTDLP_AUTO_UPDATE=1
     # Enable NVIDIA GPU access
     deploy:
       resources:

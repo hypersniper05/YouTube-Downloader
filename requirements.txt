@@ -1,7 +1,14 @@
 # YouTube to MP3/MP4 Converter with Whisper Transcription
 # For manual installation (Docker handles this automatically)
 
-yt-dlp>=2024.1.0
+# YouTube extraction needs a JavaScript runtime plus the player-challenge solver.
+# Without both, every download fails with "HTTP Error 403: Forbidden".
+#   [default] pulls in yt-dlp-ejs (the solver, exact-pinned by yt-dlp)
+#   [deno]    pulls in the Deno runtime as a platform-correct wheel
+# Deno is preferred over Node because it sandboxes the untrusted player JS.
+# If you already have Deno or Node on PATH, plain yt-dlp[default] is enough.
+yt-dlp[default,deno]>=2026.8.19
+
 torch
 transformers>=4.40.0
 accelerate
@@ -12,4 +19,4 @@ accelerate
 # Windows: winget install FFmpeg
 
 # Note: For GPU support, install PyTorch with CUDA:
-# pip install torch --index-url https://download.pytorch.org/whl/cu124
+# pip install torch --index-url https://download.pytorch.org/whl/cu128

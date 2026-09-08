@@ -50,7 +50,11 @@ docker run -d -p 6080:8080 --gpus 1 --name ytdl-web ytdl-web
 # macOS: brew install ffmpeg
 # Windows: winget install FFmpeg
 
-pip install yt-dlp
+# yt-dlp needs a JavaScript runtime plus the player-challenge solver, or every
+# download fails with "HTTP Error 403: Forbidden". Both come from these extras:
+#   [default] -> yt-dlp-ejs, the solver
+#   [deno]    -> the Deno runtime (sandboxes the untrusted player JS)
+pip install "yt-dlp[default,deno]"
 # For transcription support:
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install "transformers>=4.40.0" accelerate
@@ -184,6 +188,9 @@ Transcription falls back to CPU if no GPU is available, but will be significantl
 | Port in use | Change port in docker-compose.yml |
 | Can't access from other devices | Check firewall, ensure same network |
 | Conversion fails | Video may be private, age-restricted, or unavailable |
+| `HTTP Error 403: Forbidden` | yt-dlp is stale or missing its JS player-challenge solver. Rebuild with a bumped refresh arg - see [Updating](#updating) |
+| `No supported JavaScript runtime could be found` | No Deno/Node in the environment. The Docker image ships Deno; for a manual install see [Manual Installation](#manual-installation) |
+| Still 403 after a restart | Not a stale-yt-dlp problem. YouTube also blocks some datacenter/VPN IPs and gates certain videos behind sign-in, which needs cookies or a PO token — neither is wired up here |
 | No audio in MP4 | Already fixed - audio is converted to AAC |
 | Progress stuck | Large files take time, check network connection |
 | Transcription fails with CUDA error | Ensure PyTorch version matches your GPU architecture |
@@ -196,6 +203,31 @@ Transcription falls back to CPU if no GPU is available, but will be significantl
 git pull
 docker compose up -d --build
 ```
+
+### Keeping yt-dlp current
+
+YouTube changes its extraction every few weeks, which leaves a stale yt-dlp failing
+every download with `403 Forbidden`. The container refreshes yt-dlp on **every start**,
+so recovering is just:
+
+```bash
+docker compose restart
+```
+
+Set `YTDLP_AUTO_UPDATE=0` in `docker-compose.yml` to disable that and pin to whatever
+version is baked into the image. If PyPI is unreachable at boot the update is skipped
+with a warning and the container still starts. The entrypoint logs the yt-dlp and Deno
+versions it ends up with — check with `docker logs ytdl-web`.
+
+To refresh the baked-in version too, note that a plain `--build` will **not** do it:
+the yt-dlp layer is a cache hit. Bump `YTDLP_REFRESH` to any new value:
+
+```bash
+docker compose build --build-arg YTDLP_REFRESH=2
+docker compose up -d
+```
+
+Use a different number each time (3, 4, ...). Works as-is in PowerShell, CMD and bash.
 
 ## Tech Stack
 

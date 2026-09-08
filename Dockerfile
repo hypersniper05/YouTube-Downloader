@@ -38,12 +38,35 @@ RUN pip install --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/cu128
 
 RUN pip install --no-cache-dir \
-    yt-dlp \
     "transformers>=4.40.0" \
     accelerate
 
+# yt-dlp goes stale quickly as YouTube changes; keep it in its own layer.
+#
+# YouTube serves an obfuscated JavaScript player challenge that must be executed to
+# derive the signature / nsig values in a stream URL. Without a JS runtime and the
+# solver, yt-dlp cannot build a usable URL and every download fails with
+# "HTTP Error 403: Forbidden". Both pieces come from yt-dlp's own extras:
+#   [default] -> yt-dlp-ejs, the solver yt-dlp feeds to the runtime (exact-pinned by yt-dlp)
+#   [deno]    -> the Deno binary, as a platform-correct PyPI wheel
+# Deno is preferred over Node because it sandboxes the untrusted player JS. Taking both
+# from the extras keeps their versions consistent with the yt-dlp release and keeps this
+# layer architecture-independent.
+#
+# Bump YTDLP_REFRESH (or build with --no-cache) to pull a newer yt-dlp.
+ARG YTDLP_REFRESH=1
+RUN pip install --no-cache-dir -U \
+    "yt-dlp[default,deno]>=2026.8.19" && \
+    yt-dlp --version && \
+    deno --version
+
 # Copy application
 COPY server.py .
+
+# Refresh yt-dlp on container start so a `docker compose restart` recovers from a
+# YouTube change without a rebuild. Opt out with YTDLP_AUTO_UPDATE=0.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Create directories
 RUN mkdir -p /app/downloads /app/whisper-model
@@ -52,4 +75,5 @@ RUN mkdir -p /app/downloads /app/whisper-model
 EXPOSE 8080
 
 # Run server
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["python", "server.py"]
