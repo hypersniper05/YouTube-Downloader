@@ -111,7 +111,7 @@ Set these values in the `environment:` section of `docker-compose.yml`.
 | `MCP_ALLOWED_ORIGINS` | not set | More browser origins that can call `/mcp`, separated by commas |
 | `PUBLIC_BASE_URL` | not set | The public URL for download links, if the server is behind a proxy |
 | `YTDLP_AUTO_UPDATE` | `1` | Updates yt-dlp each time the container starts |
-| `YTDLP_403_RETRIES` | `3` | The number of retries when YouTube refuses a download |
+| `YTDLP_RETRIES` | `3` | The number of retries when YouTube refuses a download or yt-dlp crashes |
 | `WHISPER_MODEL_ID` | `openai/whisper-large-v3-turbo` | The Whisper model. Smaller models, such as `openai/whisper-small`, are faster |
 
 To change the port, edit `ports:` in `docker-compose.yml`.

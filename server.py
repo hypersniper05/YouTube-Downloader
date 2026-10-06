@@ -1436,10 +1436,14 @@ def fetch_video_metadata(url):
         '--js-runtimes', 'node',
         url
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    if result.returncode != 0:
-        raise Exception(f"Failed to get video info: {result.stderr}")
-    return json.loads(result.stdout)
+    for attempt in range(1, 2 + YTDLP_RETRIES):
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+        # A 403 cannot happen here (no media is fetched), but yt-dlp can still crash.
+        if ytdlp_failure_kind(result.returncode, result.stderr) != 'crash' or attempt > YTDLP_RETRIES:
+            raise Exception(f"Failed to get video info: {result.stderr}")
+        print(f"[yt-dlp] Video info: yt-dlp crashed; retrying ({attempt + 1}/{1 + YTDLP_RETRIES})")
 
 
 def get_video_info(url):
@@ -1463,6 +1467,9 @@ def _set_task_message(task_id, message, progress=None):
 
 def _finish_task(task_id, record):
     """Publish a job's final state. The hourly cleanup's retention window starts now."""
+    if record.get('status') == 'error':
+        # The task record is deleted with the job, so keep the reason in the server log.
+        print(f"[job] Task {task_id} failed: {' / '.join(str(record.get('error')).splitlines()[-3:])}")
     try:
         os.utime(DOWNLOAD_DIR / task_id)
     except OSError:
@@ -1471,19 +1478,32 @@ def _finish_task(task_id, record):
         active_downloads[task_id] = record
 
 
-# YouTube intermittently refuses a freshly issued stream URL with HTTP 403 on the very first
-# request - more often after a burst of downloads. yt-dlp treats that as fatal, but a new
-# extraction gets a new URL that almost always works (yt-dlp issue #17395, closed as an
-# external issue). So a 403 is retried with a fresh yt-dlp run.
+# Two yt-dlp failures are transient, so a fresh yt-dlp run usually succeeds:
+# - YouTube intermittently refuses a freshly issued stream URL with HTTP 403 on the very first
+#   request, more often after a burst of downloads (yt-dlp issue #17395, an external issue).
+# - The yt-dlp process itself sometimes crashes while building YouTube's caption URLs: a
+#   segfault, or a nonsensical "'<' not supported between instances of 'function' and 'str'".
+#   Both point to memory corruption in native code; the rate swings with YouTube's responses.
 try:
-    YTDLP_403_RETRIES = max(0, int(os.environ.get('YTDLP_403_RETRIES', '3')))
+    YTDLP_RETRIES = max(0, int(os.environ.get('YTDLP_RETRIES', '3')))
 except ValueError:
-    YTDLP_403_RETRIES = 3
+    YTDLP_RETRIES = 3
+
+_YTDLP_CORRUPTION_SIGNS = ("not supported between instances of 'function' and 'str'",)
+
+
+def ytdlp_failure_kind(returncode, output):
+    """Classify a failed yt-dlp run: '403' or 'crash' are worth retrying, None is not."""
+    if returncode < 0 or any(sign in output for sign in _YTDLP_CORRUPTION_SIGNS):
+        return 'crash'
+    if 'HTTP Error 403' in output:
+        return '403'
+    return None
 
 
 def run_ytdlp(task_id, cmd, timeout, downloading_message, finishing_message):
     """Run yt-dlp, publishing its progress to the task. Raises if it fails."""
-    attempts = 1 + YTDLP_403_RETRIES
+    attempts = 1 + YTDLP_RETRIES
     for attempt in range(1, attempts + 1):
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
@@ -1509,16 +1529,18 @@ def run_ytdlp(task_id, cmd, timeout, downloading_message, finishing_message):
             return
 
         error_detail = '\n'.join(last_lines[-5:]) if last_lines else 'No output captured'
-        if 'HTTP Error 403' not in error_detail or attempt == attempts:
+        kind = ytdlp_failure_kind(process.returncode, error_detail)
+        if kind == 'crash' and process.returncode < 0:
+            error_detail += f'\n(yt-dlp crashed with signal {-process.returncode})'
+        if kind is None or attempt == attempts:
             if attempt > 1:
-                error_detail += f'\n(YouTube refused the stream on all {attempt} attempts)'
+                error_detail += f'\n(failed on all {attempt} attempts)'
             raise Exception(f"yt-dlp download failed:\n{error_detail}")
 
-        print(f"[yt-dlp] Task {task_id}: YouTube refused the stream (HTTP 403); "
-              f"retrying with a fresh link ({attempt + 1}/{attempts})")
+        reason = 'YouTube refused the stream' if kind == '403' else 'yt-dlp crashed'
+        print(f"[yt-dlp] Task {task_id}: {reason}; retrying ({attempt + 1}/{attempts})")
         with downloads_lock:
-            active_downloads[task_id]['message'] = (f'YouTube refused the stream; retrying with a fresh '
-                                                    f'link ({attempt + 1}/{attempts})...')
+            active_downloads[task_id]['message'] = f'{reason}; retrying ({attempt + 1}/{attempts})...'
         time.sleep(2 * attempt)
 
 
