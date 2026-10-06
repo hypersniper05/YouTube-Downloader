@@ -11,11 +11,19 @@ import sys
 import uuid
 import json
 import gc
+import time
+import select
+import socket
+import hmac
+import base64
+import hashlib
 import threading
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-from urllib.parse import parse_qs, urlparse, unquote, quote
+from urllib.parse import parse_qs, urlparse, unquote, quote, quote_plus, urlencode
 import subprocess
 import shutil
 
@@ -1409,8 +1417,8 @@ def resolve_task_file(task_id, filename):
     return path
 
 
-def get_video_info(url):
-    """Get video title and duration using yt-dlp."""
+def fetch_video_metadata(url):
+    """Return yt-dlp's full info dict for a video."""
     cmd = [
         'yt-dlp',
         '--dump-json',
@@ -1421,13 +1429,27 @@ def get_video_info(url):
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise Exception(f"Failed to get video info: {result.stderr}")
+    return json.loads(result.stdout)
 
-    info = json.loads(result.stdout)
+
+def get_video_info(url):
+    """Get video title and duration using yt-dlp."""
+    info = fetch_video_metadata(url)
     return {
         'title': info.get('title', 'Unknown'),
         'duration': info.get('duration', 0),  # Duration in seconds
         'thumbnail': info.get('thumbnail', '')
     }
+
+
+def _finish_task(task_id, record):
+    """Publish a job's final state. The hourly cleanup's retention window starts now."""
+    try:
+        os.utime(DOWNLOAD_DIR / task_id)
+    except OSError:
+        pass
+    with downloads_lock:
+        active_downloads[task_id] = record
 
 
 def download_and_convert(task_id, url, bitrate='320', transcribe=False, timestamps=False):
@@ -1547,20 +1569,16 @@ def download_and_convert(task_id, url, bitrate='320', transcribe=False, timestam
                 result['transcription_filename'] = transcript_name
             except Exception as e:
                 print(f"[Whisper] Transcription failed for task {task_id}: {e}")
+                result['transcription_error'] = str(e)
             finally:
                 whisper_release()
 
-        with downloads_lock:
-            active_downloads[task_id] = result
+        _finish_task(task_id, result)
 
     except Exception as e:
         if transcribe:
             whisper_release()
-        with downloads_lock:
-            active_downloads[task_id] = {
-                'status': 'error',
-                'error': str(e)
-            }
+        _finish_task(task_id, {'status': 'error', 'error': str(e)})
 
 
 def download_video(task_id, url, resolution='1080', transcribe=False, timestamps=False):
@@ -1672,20 +1690,1353 @@ def download_video(task_id, url, resolution='1080', transcribe=False, timestamps
                 result['transcription_filename'] = transcript_name
             except Exception as e:
                 print(f"[Whisper] Transcription failed for task {task_id}: {e}")
+                result['transcription_error'] = str(e)
             finally:
                 whisper_release()
 
-        with downloads_lock:
-            active_downloads[task_id] = result
+        _finish_task(task_id, result)
 
     except Exception as e:
         if transcribe:
             whisper_release()
+        _finish_task(task_id, {'status': 'error', 'error': str(e)})
+
+
+VALID_BITRATES = ['320', '256', '192', '128', '96', '64']
+VALID_RESOLUTIONS = ['2160', '1440', '1080', '720', '480', '360']
+
+
+def _start_task(target, video_id, quality, transcribe, timestamps):
+    task_id = str(uuid.uuid4())[:8]
+    # Registered before the thread starts, so a status check made immediately after
+    # (the MCP tools make one) can never see 'not_found'.
+    with downloads_lock:
+        active_downloads[task_id] = {'status': 'processing', 'progress': 0, 'message': 'Starting...'}
+    if transcribe:
+        whisper_acquire()
+    try:
+        threading.Thread(
+            target=target,
+            args=(task_id, canonical_youtube_url(video_id), quality, bool(transcribe), bool(timestamps)),
+            daemon=True,
+        ).start()
+    except BaseException:
         with downloads_lock:
-            active_downloads[task_id] = {
-                'status': 'error',
-                'error': str(e)
+            active_downloads.pop(task_id, None)
+        if transcribe:
+            whisper_release()
+        raise
+    return task_id
+
+
+def start_audio_task(video_id, bitrate='320', transcribe=False, timestamps=False):
+    """Start an MP3 download in the background and return its task id."""
+    bitrate = str(bitrate)
+    if bitrate not in VALID_BITRATES:
+        bitrate = '320'
+    return _start_task(download_and_convert, video_id, bitrate, transcribe, timestamps)
+
+
+def start_video_task(video_id, resolution='1080', transcribe=False, timestamps=False):
+    """Start an MP4 download in the background and return its task id."""
+    resolution = str(resolution)
+    if resolution not in VALID_RESOLUTIONS:
+        resolution = '1080'
+    return _start_task(download_video, video_id, resolution, transcribe, timestamps)
+
+
+# ===========================================================================
+# MCP server - Model Context Protocol over Streamable HTTP (POST /mcp)
+# ===========================================================================
+#
+# Lets AI assistants drive the downloader. Implements protocol revision 2026-07-28,
+# which is stateless: every request carries its protocol version and client
+# capabilities in params._meta, mirrored into the MCP-Protocol-Version, Mcp-Method and
+# Mcp-Name headers, and there is no initialize handshake. Most deployed clients still
+# speak the legacy era (2025-03-26 through 2025-11-25) and open with `initialize`, so
+# that is answered too. In both eras the server keeps no protocol session: long-running
+# work is referenced by an explicit task_id that the model passes to get_task_status.
+#
+# Authorization is optional and off by default: MCP_AUTH=off | token | oauth.
+
+SERVER_VERSION = '1.1.0'
+SERVER_INFO = {'name': 'ytdl-web', 'title': 'ytdl-web YouTube Downloader', 'version': SERVER_VERSION}
+
+MCP_MODERN_VERSIONS = ['2026-07-28']
+MCP_LEGACY_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26']
+MCP_SUPPORTED_VERSIONS = MCP_MODERN_VERSIONS + MCP_LEGACY_VERSIONS
+
+META_PROTOCOL_VERSION = 'io.modelcontextprotocol/protocolVersion'
+META_CLIENT_CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities'
+META_SERVER_INFO = 'io.modelcontextprotocol/serverInfo'
+
+MCP_PATHS = ('/mcp', '/mcp/')
+MCP_PRM_PATHS = ('/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp')
+MCP_MAX_BODY_BYTES = 1024 * 1024
+MCP_DEFAULT_WAIT = 45
+MCP_MAX_WAIT = 600
+
+
+def _env_flag(name, default):
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+MCP_ENABLED = _env_flag('MCP_ENABLED', True)
+MCP_AUTH = os.environ.get('MCP_AUTH', 'off').strip().lower() or 'off'
+MCP_AUTH_TOKEN = os.environ.get('MCP_AUTH_TOKEN', '').strip()
+MCP_OAUTH_ISSUER = os.environ.get('MCP_OAUTH_ISSUER', '').strip()
+MCP_OAUTH_INTROSPECTION_URL = os.environ.get('MCP_OAUTH_INTROSPECTION_URL', '').strip()
+MCP_OAUTH_CLIENT_ID = os.environ.get('MCP_OAUTH_CLIENT_ID', '')
+MCP_OAUTH_CLIENT_SECRET = os.environ.get('MCP_OAUTH_CLIENT_SECRET', '')
+MCP_OAUTH_SCOPES = os.environ.get('MCP_OAUTH_SCOPES', '').split()
+PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', '').strip().rstrip('/')
+MCP_ALLOWED_ORIGINS = {o.strip().rstrip('/').lower()
+                       for o in os.environ.get('MCP_ALLOWED_ORIGINS', '').split(',') if o.strip()}
+MCP_MAX_ACTIVE_JOBS = max(1, _env_int('MCP_MAX_ACTIVE_JOBS', 4))
+
+
+def _mcp_config_error():
+    """Return why the MCP settings are unusable, or None. /mcp fails closed on error."""
+    if MCP_AUTH not in ('off', 'token', 'oauth'):
+        return f'MCP_AUTH must be off, token or oauth (got {MCP_AUTH!r})'
+    if MCP_AUTH == 'token' and not MCP_AUTH_TOKEN:
+        return 'MCP_AUTH=token requires MCP_AUTH_TOKEN'
+    if MCP_AUTH == 'oauth':
+        missing = [name for name, value in (('PUBLIC_BASE_URL', PUBLIC_BASE_URL),
+                                            ('MCP_OAUTH_ISSUER', MCP_OAUTH_ISSUER),
+                                            ('MCP_OAUTH_INTROSPECTION_URL', MCP_OAUTH_INTROSPECTION_URL))
+                   if not value]
+        if missing:
+            return 'MCP_AUTH=oauth requires ' + ', '.join(missing)
+    return None
+
+
+MCP_CONFIG_ERROR = _mcp_config_error()
+
+MCP_CAPABILITIES = {'tools': {'listChanged': False}}
+# 2026-07-28 requires caching hints on server/discover and tools/list results. The tool
+# list is the same for every caller and only changes with a new server version.
+MCP_CACHE_HINTS = {'ttlMs': 3600000, 'cacheScope': 'public'}
+
+MCP_INSTRUCTIONS = (
+    'ytdl-web downloads YouTube videos as MP3 audio or MP4 video and can transcribe them '
+    'with Whisper, as plain text or as SRT subtitles with timestamps. Downloads and '
+    'transcription run as background jobs: each tool waits up to wait_seconds, and if the '
+    'job is still running it returns status "processing" with a task_id. Pass that task_id '
+    'to get_task_status to keep waiting. Transcription runs on CPU and can take several '
+    'minutes for a long video. Finished files are served at the returned url and are '
+    'deleted automatically 1-2 hours after they are created.'
+)
+
+
+class McpError(Exception):
+    """A JSON-RPC error to return for the current request."""
+
+    def __init__(self, code, message, http_status=200, data=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.http_status = http_status
+        self.data = data
+
+
+class ToolError(Exception):
+    """A tool execution error, reported to the model as a result with isError set."""
+
+
+class ClientGone(Exception):
+    """The client closed the response stream, which cancels the request."""
+
+
+class AuthFailure(Exception):
+    def __init__(self, status, challenge, error, description):
+        super().__init__(description)
+        self.status = status
+        self.challenge = challenge
+        self.error = error
+        self.description = description
+
+
+# --- Origin and authorization -------------------------------------------------------
+
+def _origin_of(url):
+    parsed = urlparse(url)
+    return f'{parsed.scheme}://{parsed.netloc}'.lower()
+
+
+def mcp_origin_allowed(origin):
+    """DNS-rebinding protection for /mcp.
+
+    Native clients send no Origin. A browser-based client is allowed only from a loopback
+    page, PUBLIC_BASE_URL or MCP_ALLOWED_ORIGINS - never merely because Origin matches the
+    Host header, since a DNS-rebinding page controls both of those.
+    """
+    if origin is None:
+        return True
+    origin = origin.strip().rstrip('/').lower()
+    if origin in MCP_ALLOWED_ORIGINS:
+        return True
+    if PUBLIC_BASE_URL and origin == _origin_of(PUBLIC_BASE_URL):
+        return True
+    parsed = urlparse(origin)
+    return parsed.scheme in ('http', 'https') and parsed.hostname in ('localhost', '127.0.0.1', '::1')
+
+
+def _www_authenticate(error=None, description=None):
+    if MCP_AUTH == 'oauth':
+        params = [f'resource_metadata="{PUBLIC_BASE_URL}/.well-known/oauth-protected-resource/mcp"']
+        if MCP_OAUTH_SCOPES:
+            params.append('scope="' + ' '.join(MCP_OAUTH_SCOPES) + '"')
+    else:
+        params = ['realm="ytdl-web"']
+    if error:
+        params.append(f'error="{error}"')
+    if description:
+        params.append(f'error_description="{description}"')
+    return 'Bearer ' + ', '.join(params)
+
+
+def _norm_resource(uri):
+    parsed = urlparse(uri.strip())
+    return f'{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path.rstrip("/")}'
+
+
+# Active and inactive results are cached separately, so a flood of junk tokens can only
+# churn the negative cache, never evict the tokens of legitimate clients.
+_active_tokens = {}
+_inactive_tokens = {}
+_introspection_lock = threading.Lock()
+_introspection_slots = threading.BoundedSemaphore(8)
+_TOKEN_CACHE_MAX = 1000
+
+
+def _cache_put(cache, key, entry):
+    """Insert (expiry, claims), evicting expired entries and then the oldest."""
+    if len(cache) >= _TOKEN_CACHE_MAX:
+        now = time.time()
+        for stale in [k for k, (expiry, _) in cache.items() if expiry <= now]:
+            del cache[stale]
+        while len(cache) >= _TOKEN_CACHE_MAX:
+            del cache[next(iter(cache))]
+    cache[key] = entry
+
+
+def _introspect_token(token):
+    """Ask the authorization server about a token (RFC 7662). Results are cached briefly."""
+    key = hashlib.sha256(token.encode('utf-8')).hexdigest()
+    now = time.time()
+    with _introspection_lock:
+        for cache in (_active_tokens, _inactive_tokens):
+            hit = cache.get(key)
+            if hit and hit[0] > now:
+                return hit[1]
+
+    # Cap concurrent calls so unauthenticated traffic cannot pin threads on the
+    # authorization server or exhaust its rate limit for this client.
+    if not _introspection_slots.acquire(blocking=False):
+        raise AuthFailure(503, None, 'temporarily_unavailable', 'Too many authorization checks in flight')
+    try:
+        claims = _call_introspection_endpoint(token)
+    finally:
+        _introspection_slots.release()
+
+    ttl = 60.0 if claims.get('active') else 10.0
+    exp = claims.get('exp')
+    if isinstance(exp, (int, float)):
+        ttl = max(0.0, min(ttl, exp - now))
+    with _introspection_lock:
+        _cache_put(_active_tokens if claims.get('active') else _inactive_tokens, key, (now + ttl, claims))
+    return claims
+
+
+def _call_introspection_endpoint(token):
+
+    request = urllib.request.Request(
+        MCP_OAUTH_INTROSPECTION_URL,
+        data=urlencode({'token': token, 'token_type_hint': 'access_token'}).encode('ascii'),
+        method='POST',
+        headers={'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json'},
+    )
+    if MCP_OAUTH_CLIENT_ID:
+        # RFC 6749 2.3.1: id and secret are form-encoded before Basic encoding.
+        pair = f'{quote_plus(MCP_OAUTH_CLIENT_ID)}:{quote_plus(MCP_OAUTH_CLIENT_SECRET)}'
+        request.add_header('Authorization', 'Basic ' + base64.b64encode(pair.encode('utf-8')).decode('ascii'))
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            claims = json.loads(response.read().decode('utf-8'))
+        if not isinstance(claims, dict):
+            raise ValueError('introspection response is not a JSON object')
+    except Exception as e:
+        print(f'[MCP] Token introspection failed: {e}')
+        raise AuthFailure(503, None, 'temporarily_unavailable', 'Authorization server unavailable')
+    return claims
+
+
+def mcp_authorize(headers):
+    """Raise AuthFailure unless the request is allowed to use /mcp."""
+    if MCP_AUTH == 'off':
+        return
+    scheme, _, token = (headers.get('Authorization') or '').partition(' ')
+    token = token.strip()
+    if scheme.lower() != 'bearer' or not token:
+        raise AuthFailure(401, _www_authenticate(), 'invalid_request', 'Authorization required')
+
+    if MCP_AUTH == 'token':
+        if not hmac.compare_digest(token.encode('utf-8'), MCP_AUTH_TOKEN.encode('utf-8')):
+            raise AuthFailure(401, _www_authenticate('invalid_token'), 'invalid_token', 'Invalid token')
+        return
+
+    claims = _introspect_token(token)
+    if not claims.get('active'):
+        raise AuthFailure(401, _www_authenticate('invalid_token', 'Token is not active'),
+                          'invalid_token', 'Token is not active')
+    exp = claims.get('exp')
+    if isinstance(exp, (int, float)) and exp < time.time():
+        raise AuthFailure(401, _www_authenticate('invalid_token', 'Token has expired'),
+                          'invalid_token', 'Token has expired')
+    # RFC 8707: only accept tokens issued for this server.
+    aud = claims.get('aud')
+    audiences = [aud] if isinstance(aud, str) else (aud if isinstance(aud, list) else [])
+    accepted = {_norm_resource(PUBLIC_BASE_URL + '/mcp'), _norm_resource(PUBLIC_BASE_URL)}
+    if not any(isinstance(a, str) and _norm_resource(a) in accepted for a in audiences):
+        raise AuthFailure(401, _www_authenticate('invalid_token', 'Token was not issued for this server'),
+                          'invalid_token', 'Token was not issued for this server')
+    granted = set(str(claims.get('scope') or '').split())
+    if MCP_OAUTH_SCOPES and not set(MCP_OAUTH_SCOPES) <= granted:
+        raise AuthFailure(403, _www_authenticate('insufficient_scope', 'Token lacks a required scope'),
+                          'insufficient_scope', 'Token lacks a required scope')
+
+
+def protected_resource_metadata():
+    """OAuth 2.0 Protected Resource Metadata (RFC 9728) for MCP_AUTH=oauth."""
+    doc = {
+        'resource': f'{PUBLIC_BASE_URL}/mcp',
+        'authorization_servers': [MCP_OAUTH_ISSUER],
+        'bearer_methods_supported': ['header'],
+        'resource_name': 'ytdl-web',
+    }
+    if MCP_OAUTH_SCOPES:
+        doc['scopes_supported'] = MCP_OAUTH_SCOPES
+    return doc
+
+
+# --- Tasks as seen by MCP clients ---------------------------------------------------
+
+_HOST_RE = re.compile(r'^([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:\d{1,5})?$')
+MEDIA_EXTS = ('.mp3', '.mp4', '.mkv', '.webm')
+TRANSCRIPT_EXTS = {'.srt': 'srt', '.txt': 'text'}
+# yt-dlp leftovers: per-format streams (name.f398.mp4), merge temp files, partials.
+_INTERMEDIATE_RE = re.compile(r'\.(f\d+(-\d+)?|temp)\.[^.]+$|\.(part|ytdl)$')
+MIME_TYPES = {
+    '.mp3': 'audio/mpeg',
+    '.mp4': 'video/mp4',
+    '.mkv': 'video/x-matroska',
+    '.webm': 'video/webm',
+    '.srt': 'application/x-subrip',
+    '.txt': 'text/plain',
+}
+_job_start_lock = threading.Lock()
+# Each waiting tools/call holds a thread; past this many, calls return without waiting.
+_wait_slots = threading.BoundedSemaphore(32)
+
+
+def client_connected(handler):
+    """False once the client has closed its end of the connection."""
+    try:
+        readable, _, _ = select.select([handler.connection], [], [], 0)
+        return not readable or handler.connection.recv(1, socket.MSG_PEEK) != b''
+    except (OSError, ValueError):
+        return False
+
+
+def request_base_url(headers):
+    """Absolute base URL for the download links handed back to MCP clients."""
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    proto = (headers.get('X-Forwarded-Proto') or 'http').split(',')[0].strip().lower()
+    host = (headers.get('X-Forwarded-Host') or headers.get('Host') or '').split(',')[0].strip()
+    if proto not in ('http', 'https'):
+        proto = 'http'
+    if not _HOST_RE.match(host):
+        host = f'localhost:{EXTERNAL_PORT}'
+    return f'{proto}://{host}'
+
+
+def _file_entry(task_id, path, base_url):
+    entry = {
+        'name': path.name,
+        'url': f'{base_url}/download/{task_id}/{quote(path.name)}',
+        'mime_type': MIME_TYPES.get(path.suffix.lower(), 'application/octet-stream'),
+    }
+    try:
+        entry['size_bytes'] = path.stat().st_size
+    except OSError:
+        pass
+    return entry
+
+
+def _finished_files(task_dir):
+    """Files in a task directory that are deliverables rather than yt-dlp leftovers."""
+    try:
+        files = [p for p in task_dir.iterdir() if p.is_file() and not _INTERMEDIATE_RE.search(p.name)]
+    except OSError:
+        return []
+    return sorted(files, key=lambda p: p.name)
+
+
+def _read_transcript(path, max_chars):
+    """Return (text, truncated, total_chars)."""
+    text = path.read_text(encoding='utf-8', errors='replace')
+    if len(text) > max_chars:
+        return text[:max_chars], True, len(text)
+    return text, False, len(text)
+
+
+def task_snapshot(task_id, base_url, transcript_chars=20000):
+    """Describe a task for an MCP client. Raises ToolError for an unknown or expired id."""
+    task_dir = resolve_task_dir(task_id)
+    if task_dir is None:
+        raise ToolError(f'Invalid task_id {task_id!r}: expected the 8-character id returned when the job started.')
+    with downloads_lock:
+        entry = dict(active_downloads.get(task_id) or {})
+
+    status = entry.get('status')
+    if status == 'processing':
+        return {
+            'task_id': task_id,
+            'status': 'processing',
+            'progress': round(float(entry.get('progress') or 0), 1),
+            'message': entry.get('message') or 'Processing...',
+        }
+    if status == 'error':
+        return {'task_id': task_id, 'status': 'error', 'error': entry.get('error') or 'Unknown error'}
+
+    # Completed - or finished before a server restart emptied active_downloads, in which
+    # case the files on disk are the record.
+    if not task_dir.is_dir():
+        raise ToolError(f'Unknown or expired task_id {task_id}. Files are deleted 1-2 hours after '
+                        'they are created; start a new download.')
+    media = transcript = None
+    for path in _finished_files(task_dir):
+        ext = path.suffix.lower()
+        if ext in MEDIA_EXTS and media is None:
+            media = path
+        elif ext in TRANSCRIPT_EXTS and transcript is None:
+            transcript = path
+    for key, ext_ok in (('filename', MEDIA_EXTS), ('transcription_filename', tuple(TRANSCRIPT_EXTS))):
+        named = resolve_task_file(task_id, entry.get(key) or '')
+        if named is not None and named.is_file() and named.suffix.lower() in ext_ok:
+            if key == 'filename':
+                media = named
+            else:
+                transcript = named
+    if media is None and transcript is None:
+        raise ToolError(f'Task {task_id} has no finished files (it may have been interrupted). '
+                        'Start a new download.')
+
+    out = {'task_id': task_id, 'status': 'completed', 'progress': 100}
+    if media is not None:
+        out['file'] = _file_entry(task_id, media, base_url)
+    if transcript is not None:
+        out['transcript_file'] = _file_entry(task_id, transcript, base_url)
+        out['transcript_format'] = TRANSCRIPT_EXTS[transcript.suffix.lower()]
+        if transcript_chars:
+            text, truncated, _ = _read_transcript(transcript, transcript_chars)
+            out['transcript'] = text
+            out['transcript_truncated'] = truncated
+    if entry.get('transcription_error'):
+        out['transcription_error'] = entry['transcription_error']
+    return out
+
+
+def _overall_progress(raw, message):
+    """Map the per-phase progress a job reports onto one 0-100 scale.
+
+    The raw value restarts per phase (yt-dlp download reaches 100, then extraction reports
+    95 and transcription 98), so the phase is taken from the status message instead.
+    """
+    message = (message or '').lower()
+    if message.startswith('transcribing'):
+        return 95.0
+    if 'convert' in message or 'merg' in message:
+        return 92.0
+    try:
+        return min(90.0, float(raw or 0) * 0.9)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _wait_for_task(task_id, wait_seconds, progress, alive):
+    """Block until the task stops processing or wait_seconds pass, reporting progress.
+
+    progress(value, message) is called at most once a second on change, and at least every
+    15 seconds regardless, so a client's request timeout keeps resetting during a long
+    transcription. alive() is polled every half second; a hung-up client raises ClientGone.
+    """
+    deadline = time.monotonic() + wait_seconds
+    last_key = None
+    last_sent = 0.0
+    while True:
+        with downloads_lock:
+            entry = active_downloads.get(task_id) or {}
+            status, raw, message = entry.get('status'), entry.get('progress'), entry.get('message')
+        if status != 'processing':
+            return
+        if alive is not None and not alive():
+            raise ClientGone()
+        now = time.monotonic()
+        if progress is not None:
+            key = (raw, message)
+            if (key != last_key and now - last_sent >= 1.0) or now - last_sent >= 15.0:
+                progress(_overall_progress(raw, message), message or 'Processing...')
+                last_key, last_sent = key, now
+        if now >= deadline:
+            return
+        time.sleep(min(0.5, deadline - now))
+
+
+def _wait_and_snapshot(task_id, wait_seconds, ctx, transcript_chars=20000):
+    if wait_seconds and _wait_slots.acquire(blocking=False):
+        try:
+            _wait_for_task(task_id, wait_seconds, ctx['progress'], ctx['alive'])
+        finally:
+            _wait_slots.release()
+    snapshot = task_snapshot(task_id, ctx['base_url'], transcript_chars)
+    if snapshot['status'] == 'processing':
+        snapshot['next_step'] = (f'Still running. Call get_task_status with task_id "{task_id}" '
+                                 f'(wait_seconds up to {MCP_MAX_WAIT}) to keep waiting.')
+    return snapshot
+
+
+def _start_job(start):
+    """Start a background job unless the server is already at MCP_MAX_ACTIVE_JOBS."""
+    with _job_start_lock:
+        with downloads_lock:
+            active = sum(1 for d in active_downloads.values() if d.get('status') == 'processing')
+        if active >= MCP_MAX_ACTIVE_JOBS:
+            raise ToolError(f'Server busy: {active} jobs already running (limit {MCP_MAX_ACTIVE_JOBS}). '
+                            'Wait for one to finish with get_task_status, then retry.')
+        return start()
+
+
+# --- Tool arguments -----------------------------------------------------------------
+
+def _arg_video_id(args):
+    url = args.get('url')
+    if not isinstance(url, str) or not url.strip():
+        raise ToolError('url is required: a YouTube video URL or an 11-character video id.')
+    url = url.strip()
+    video_id = url if re.fullmatch(r'[A-Za-z0-9_-]{11}', url) else extract_video_id(url)
+    if not video_id:
+        raise ToolError(f'Not a YouTube video URL: {url!r}. Use a youtube.com/watch?v=, youtu.be/, '
+                        '/shorts/ or /embed/ link, or the 11-character video id.')
+    return video_id
+
+
+def _arg_choice(args, name, choices, default):
+    """An integer option that also accepts '192', '192k' or '1080p'."""
+    value = args.get(name)
+    if value is None:
+        return default
+    match = None if isinstance(value, bool) else re.fullmatch(r'\s*(\d+)\s*(k|kbps|p)?\s*', str(value), re.I)
+    if not match or int(match.group(1)) not in choices:
+        raise ToolError(f'{name} must be one of {", ".join(map(str, choices))} (got {value!r}).')
+    return int(match.group(1))
+
+
+def _arg_bool(args, name, default=False):
+    value = args.get(name)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ('true', 'false', 'yes', 'no', '1', '0'):
+        return value.strip().lower() in ('true', 'yes', '1')
+    raise ToolError(f'{name} must be true or false (got {value!r}).')
+
+
+def _arg_int(args, name, default, lo, hi):
+    value = args.get(name)
+    if value is None:
+        return default
+    try:
+        if isinstance(value, bool):
+            raise ValueError(value)
+        number = int(float(value))
+    except (TypeError, ValueError):
+        raise ToolError(f'{name} must be a number from {lo} to {hi} (got {value!r}).')
+    return max(lo, min(hi, number))
+
+
+def _arg_enum(args, name, choices, default):
+    value = args.get(name)
+    if value is None:
+        return default
+    if not isinstance(value, str) or value.strip().lower() not in choices:
+        raise ToolError(f'{name} must be one of {", ".join(choices)} (got {value!r}).')
+    return value.strip().lower()
+
+
+def _arg_task_id(args):
+    task_id = args.get('task_id')
+    task_id = task_id.strip().lower() if isinstance(task_id, str) else task_id
+    if resolve_task_dir(task_id) is None:
+        raise ToolError(f'task_id must be the 8-character id returned when the job started (got {task_id!r}).')
+    return task_id
+
+
+# --- Tools --------------------------------------------------------------------------
+
+AUDIO_BITRATES = sorted(int(b) for b in VALID_BITRATES)
+VIDEO_RESOLUTIONS = sorted(int(r) for r in VALID_RESOLUTIONS)
+
+
+def _fmt_duration(seconds):
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    return f'{hours}:{minutes:02d}:{secs:02d}' if hours else f'{minutes}:{secs:02d}'
+
+
+def _resolution_caps(max_height):
+    """Resolution caps that give distinct results for a video whose tallest stream is max_height.
+
+    download_video takes the best stream at or below the cap, so the smallest cap at or above
+    max_height is the one that gets the best stream - e.g. 2160 for a 1080x1920 Short, or 360
+    for a 240p-only upload.
+    """
+    if not max_height:
+        return []
+    caps = [r for r in VIDEO_RESOLUTIONS if r < max_height]
+    top = next((r for r in VIDEO_RESOLUTIONS if r >= max_height), None)
+    return caps + [top] if top else caps
+
+
+def tool_get_video_info(args, ctx):
+    video_id = _arg_video_id(args)
+    url = canonical_youtube_url(video_id)
+    info = fetch_video_metadata(url)
+    duration = int(info.get('duration') or 0)
+    heights = [f['height'] for f in info.get('formats') or []
+               if isinstance(f.get('height'), int) and f.get('vcodec') != 'none']
+    max_height = max(heights, default=0)
+    out = {
+        'video_id': video_id,
+        'url': url,
+        'title': info.get('title') or 'Unknown',
+        'channel': info.get('channel') or info.get('uploader') or '',
+        'duration_seconds': duration,
+        'duration': _fmt_duration(duration),
+        'thumbnail': info.get('thumbnail') or '',
+        'available_resolutions': _resolution_caps(max_height),
+        'audio_bitrates': AUDIO_BITRATES,
+    }
+    upload_date = info.get('upload_date')
+    if isinstance(upload_date, str) and re.fullmatch(r'\d{8}', upload_date):
+        out['upload_date'] = f'{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}'
+    if isinstance(info.get('view_count'), int):
+        out['view_count'] = info['view_count']
+    if info.get('is_live'):
+        out['is_live'] = True
+    return out
+
+
+def tool_download_audio(args, ctx):
+    video_id = _arg_video_id(args)
+    bitrate = _arg_choice(args, 'bitrate', AUDIO_BITRATES, 320)
+    transcribe = _arg_bool(args, 'transcribe')
+    srt = _arg_enum(args, 'transcript_format', ('srt', 'text'), 'srt') == 'srt'
+    wait = _arg_int(args, 'wait_seconds', MCP_DEFAULT_WAIT, 0, MCP_MAX_WAIT)
+    task_id = _start_job(lambda: start_audio_task(video_id, str(bitrate), transcribe, srt))
+    print(f'[MCP] download_audio {video_id} {bitrate}k transcribe={transcribe} -> task {task_id}')
+    return _wait_and_snapshot(task_id, wait, ctx)
+
+
+def tool_download_video(args, ctx):
+    video_id = _arg_video_id(args)
+    resolution = _arg_choice(args, 'resolution', VIDEO_RESOLUTIONS, 1080)
+    transcribe = _arg_bool(args, 'transcribe')
+    srt = _arg_enum(args, 'transcript_format', ('srt', 'text'), 'srt') == 'srt'
+    wait = _arg_int(args, 'wait_seconds', MCP_DEFAULT_WAIT, 0, MCP_MAX_WAIT)
+    task_id = _start_job(lambda: start_video_task(video_id, str(resolution), transcribe, srt))
+    print(f'[MCP] download_video {video_id} {resolution}p transcribe={transcribe} -> task {task_id}')
+    return _wait_and_snapshot(task_id, wait, ctx)
+
+
+def tool_transcribe_video(args, ctx):
+    video_id = _arg_video_id(args)
+    srt = _arg_enum(args, 'format', ('srt', 'text'), 'srt') == 'srt'
+    wait = _arg_int(args, 'wait_seconds', MCP_DEFAULT_WAIT, 0, MCP_MAX_WAIT)
+    # Whisper resamples to 16 kHz mono, so the lowest bitrate loses nothing.
+    task_id = _start_job(lambda: start_audio_task(video_id, '64', True, srt))
+    print(f'[MCP] transcribe_video {video_id} format={"srt" if srt else "text"} -> task {task_id}')
+    return _wait_and_snapshot(task_id, wait, ctx, transcript_chars=50000)
+
+
+def tool_get_task_status(args, ctx):
+    task_id = _arg_task_id(args)
+    wait = _arg_int(args, 'wait_seconds', 30, 0, MCP_MAX_WAIT)
+    task_snapshot(task_id, ctx['base_url'], 0)  # unknown or expired id: fail before waiting
+    return _wait_and_snapshot(task_id, wait, ctx)
+
+
+def tool_get_transcript(args, ctx):
+    task_id = _arg_task_id(args)
+    max_chars = _arg_int(args, 'max_chars', 100000, 1000, 2000000)
+    snapshot = task_snapshot(task_id, ctx['base_url'], 0)
+    if snapshot['status'] == 'processing':
+        raise ToolError(f'Task {task_id} is still running ({snapshot["progress"]}%: {snapshot["message"]}). '
+                        'Call get_task_status with wait_seconds to wait for it.')
+    if snapshot['status'] == 'error':
+        raise ToolError(f'Task {task_id} failed: {snapshot["error"]}')
+    if 'transcript_file' not in snapshot:
+        reason = snapshot.get('transcription_error')
+        raise ToolError(f'Task {task_id} has no transcript. ' + (
+            f'Transcription failed: {reason}' if reason else
+            'Use transcribe_video, or download_audio / download_video with transcribe=true.'))
+    path = resolve_task_file(task_id, snapshot['transcript_file']['name'])
+    text, truncated, total = _read_transcript(path, max_chars)
+    return {
+        'task_id': task_id,
+        'format': snapshot['transcript_format'],
+        'transcript': text,
+        'truncated': truncated,
+        'total_chars': total,
+        'file': snapshot['transcript_file'],
+    }
+
+
+def tool_list_downloads(args, ctx):
+    dirs = []
+    try:
+        for d in DOWNLOAD_DIR.iterdir():
+            if TASK_ID_RE.match(d.name):
+                try:
+                    if d.is_dir():
+                        dirs.append((d.stat().st_mtime, d))
+                except OSError:  # deleted while listing
+                    pass
+    except OSError:
+        pass
+    dirs.sort(key=lambda item: item[0], reverse=True)
+    rows = []
+    for mtime, task_dir in dirs[:200]:
+        task_id = task_dir.name
+        with downloads_lock:
+            entry = dict(active_downloads.get(task_id) or {})
+        modified = datetime.fromtimestamp(mtime, timezone.utc)
+        row = {'task_id': task_id, 'modified': modified.isoformat(timespec='seconds'), 'files': []}
+        if entry.get('status') == 'processing':
+            row.update(status='processing', progress=round(float(entry.get('progress') or 0), 1),
+                       message=entry.get('message') or 'Processing...')
+        elif entry.get('status') == 'error':
+            row.update(status='error', error=entry.get('error') or 'Unknown error')
+        else:
+            files = _finished_files(task_dir)
+            # The names a job recorded beat the leftover-file heuristic (a title can
+            # legitimately end in '.f1').
+            for key in ('filename', 'transcription_filename'):
+                named = resolve_task_file(task_id, entry.get(key) or '')
+                if named is not None and named.is_file() and named not in files:
+                    files.append(named)
+            files.sort(key=lambda p: p.name)
+            row['status'] = 'completed' if files else 'incomplete'
+            row['files'] = [_file_entry(task_id, p, ctx['base_url']) for p in files]
+        rows.append(row)
+    return {'downloads': rows, 'count': len(rows)}
+
+
+def tool_delete_download(args, ctx):
+    task_id = _arg_task_id(args)
+    with downloads_lock:
+        entry = active_downloads.get(task_id)
+        if entry and entry.get('status') == 'processing':
+            raise ToolError(f'Task {task_id} is still running. Wait for it with get_task_status, then delete it.')
+        active_downloads.pop(task_id, None)
+    task_dir = resolve_task_dir(task_id)
+    existed = task_dir.is_dir()
+    if existed:
+        shutil.rmtree(task_dir)
+    print(f'[MCP] delete_download {task_id} deleted={existed}')
+    return {'task_id': task_id, 'deleted': existed}
+
+
+# --- Tool definitions ---------------------------------------------------------------
+
+_URL_ARG = {'type': 'string', 'description': 'YouTube video URL (youtube.com/watch?v=..., youtu.be/..., '
+            '/shorts/... or /embed/...) or a bare 11-character video id.'}
+_WAIT_ARG = {'type': 'integer', 'minimum': 0, 'maximum': MCP_MAX_WAIT, 'default': MCP_DEFAULT_WAIT,
+             'description': 'Seconds to wait for the job to finish. If it is still running after that, the '
+             'result has status "processing" and a task_id to pass to get_task_status.'}
+_TASK_ID_ARG = {'type': 'string', 'pattern': '^[0-9a-f]{8}$',
+                'description': 'The 8-character task_id returned by download_audio, download_video or transcribe_video.'}
+_TRANSCRIBE_ARG = {'type': 'boolean', 'default': False,
+                   'description': 'Also transcribe the audio with Whisper. Runs on CPU: allow several minutes '
+                   'for a long video.'}
+_TRANSCRIPT_FORMAT_ARG = {'type': 'string', 'enum': ['srt', 'text'], 'default': 'srt',
+                          'description': '"srt" for subtitles with timestamps, "text" for plain text. '
+                          'Only used when transcribe is true.'}
+
+_FILE_OUT = {
+    'type': 'object',
+    'properties': {
+        'name': {'type': 'string'},
+        'url': {'type': 'string', 'description': 'Direct HTTP download link.'},
+        'mime_type': {'type': 'string'},
+        'size_bytes': {'type': 'integer'},
+    },
+    'required': ['name', 'url', 'mime_type'],
+}
+
+_TASK_OUT = {
+    'type': 'object',
+    'properties': {
+        'task_id': {'type': 'string'},
+        'status': {'type': 'string', 'enum': ['processing', 'completed', 'error']},
+        'progress': {'type': 'number', 'description': 'Percent complete, 0-100.'},
+        'message': {'type': 'string'},
+        'error': {'type': 'string'},
+        'file': _FILE_OUT,
+        'transcript_file': _FILE_OUT,
+        'transcript_format': {'type': 'string', 'enum': ['srt', 'text']},
+        'transcript': {'type': 'string', 'description': 'Transcript text, possibly truncated - see '
+                       'transcript_truncated. get_transcript returns the full text.'},
+        'transcript_truncated': {'type': 'boolean'},
+        'transcription_error': {'type': 'string', 'description': 'Set when the download succeeded but '
+                                'transcription failed.'},
+        'next_step': {'type': 'string'},
+    },
+    'required': ['task_id', 'status'],
+}
+
+_STARTS_JOB = {'readOnlyHint': False, 'destructiveHint': False, 'idempotentHint': False, 'openWorldHint': True}
+_READS_TASKS = {'readOnlyHint': True, 'openWorldHint': False}
+
+MCP_TOOL_DEFS = [
+    {
+        'name': 'get_video_info',
+        'title': 'Get YouTube video info',
+        'description': 'Look up a YouTube video without downloading it: title, channel, duration, '
+                       'thumbnail, and which MP4 resolutions and MP3 bitrates can be requested.',
+        'inputSchema': {'type': 'object', 'properties': {'url': _URL_ARG}, 'required': ['url']},
+        'outputSchema': {
+            'type': 'object',
+            'properties': {
+                'video_id': {'type': 'string'},
+                'url': {'type': 'string'},
+                'title': {'type': 'string'},
+                'channel': {'type': 'string'},
+                'duration_seconds': {'type': 'integer'},
+                'duration': {'type': 'string', 'description': 'H:MM:SS or M:SS'},
+                'thumbnail': {'type': 'string'},
+                'upload_date': {'type': 'string', 'description': 'YYYY-MM-DD'},
+                'view_count': {'type': 'integer'},
+                'is_live': {'type': 'boolean'},
+                'available_resolutions': {'type': 'array', 'items': {'type': 'integer'}},
+                'audio_bitrates': {'type': 'array', 'items': {'type': 'integer'}},
+            },
+            'required': ['video_id', 'url', 'title', 'duration_seconds', 'available_resolutions',
+                         'audio_bitrates'],
+        },
+        'annotations': {'title': 'Get YouTube video info', 'readOnlyHint': True, 'openWorldHint': True},
+    },
+    {
+        'name': 'download_audio',
+        'title': 'Download YouTube audio as MP3',
+        'description': 'Download a YouTube video as an MP3 and optionally transcribe it (plain text or SRT '
+                       'subtitles). Returns direct download links. Long jobs return a task_id to poll with '
+                       'get_task_status. Files are deleted 1-2 hours after they are created.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'url': _URL_ARG,
+                'bitrate': {'type': 'integer', 'enum': AUDIO_BITRATES, 'default': 320,
+                            'description': 'MP3 bitrate in kbps.'},
+                'transcribe': _TRANSCRIBE_ARG,
+                'transcript_format': _TRANSCRIPT_FORMAT_ARG,
+                'wait_seconds': _WAIT_ARG,
+            },
+            'required': ['url'],
+        },
+        'outputSchema': _TASK_OUT,
+        'annotations': dict(_STARTS_JOB, title='Download YouTube audio as MP3'),
+    },
+    {
+        'name': 'download_video',
+        'title': 'Download YouTube video as MP4',
+        'description': 'Download a YouTube video as an MP4 at up to the requested resolution (lower if the '
+                       'video has no such stream) and optionally transcribe it (plain text or SRT subtitles). '
+                       'Returns direct download links. Long jobs return a task_id to poll with '
+                       'get_task_status. Files are deleted 1-2 hours after they are created.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'url': _URL_ARG,
+                'resolution': {'type': 'integer', 'enum': VIDEO_RESOLUTIONS, 'default': 1080,
+                               'description': 'Maximum video height in pixels.'},
+                'transcribe': _TRANSCRIBE_ARG,
+                'transcript_format': _TRANSCRIPT_FORMAT_ARG,
+                'wait_seconds': _WAIT_ARG,
+            },
+            'required': ['url'],
+        },
+        'outputSchema': _TASK_OUT,
+        'annotations': dict(_STARTS_JOB, title='Download YouTube video as MP4'),
+    },
+    {
+        'name': 'transcribe_video',
+        'title': 'Transcribe a YouTube video',
+        'description': 'Transcribe a YouTube video with Whisper and return the transcript, as SRT subtitles '
+                       'with timestamps (default) or plain text, plus a link to the .srt/.txt file. Use this '
+                       'when you want the words rather than the media. Runs on CPU: a long video can take '
+                       'several minutes, in which case this returns a task_id to poll with get_task_status.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'url': _URL_ARG,
+                'format': {'type': 'string', 'enum': ['srt', 'text'], 'default': 'srt',
+                           'description': '"srt" for subtitles with timestamps, "text" for plain text.'},
+                'wait_seconds': _WAIT_ARG,
+            },
+            'required': ['url'],
+        },
+        'outputSchema': _TASK_OUT,
+        'annotations': dict(_STARTS_JOB, title='Transcribe a YouTube video'),
+    },
+    {
+        'name': 'get_task_status',
+        'title': 'Get job status',
+        'description': 'Check on, or wait for, a job started by download_audio, download_video or '
+                       'transcribe_video. Returns its progress while running, and the download links (and '
+                       'transcript, if one was requested) once it completes.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'task_id': _TASK_ID_ARG,
+                'wait_seconds': dict(_WAIT_ARG, default=30, description='Seconds to wait for the job to '
+                                     'finish before returning its current status. 0 returns immediately.'),
+            },
+            'required': ['task_id'],
+        },
+        'outputSchema': _TASK_OUT,
+        'annotations': dict(_READS_TASKS, title='Get job status'),
+    },
+    {
+        'name': 'get_transcript',
+        'title': 'Get transcript text',
+        'description': 'Return the full transcript (SRT or plain text) of a finished job that was '
+                       'transcribed. Use it when a result said transcript_truncated, or to re-read a '
+                       'transcript later.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'task_id': _TASK_ID_ARG,
+                'max_chars': {'type': 'integer', 'minimum': 1000, 'maximum': 2000000, 'default': 100000,
+                              'description': 'Truncate the transcript to this many characters.'},
+            },
+            'required': ['task_id'],
+        },
+        'outputSchema': {
+            'type': 'object',
+            'properties': {
+                'task_id': {'type': 'string'},
+                'format': {'type': 'string', 'enum': ['srt', 'text']},
+                'transcript': {'type': 'string'},
+                'truncated': {'type': 'boolean'},
+                'total_chars': {'type': 'integer'},
+                'file': _FILE_OUT,
+            },
+            'required': ['task_id', 'format', 'transcript', 'truncated', 'total_chars', 'file'],
+        },
+        'annotations': dict(_READS_TASKS, title='Get transcript text'),
+    },
+    {
+        'name': 'list_downloads',
+        'title': 'List downloads',
+        'description': 'List the jobs whose files are still on the server, newest first, with their status '
+                       'and download links. Files are deleted 1-2 hours after they are created.',
+        'inputSchema': {'type': 'object', 'properties': {}, 'additionalProperties': False},
+        'outputSchema': {
+            'type': 'object',
+            'properties': {
+                'downloads': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'task_id': {'type': 'string'},
+                            'status': {'type': 'string',
+                                       'enum': ['processing', 'completed', 'error', 'incomplete']},
+                            'modified': {'type': 'string', 'description': 'ISO 8601 UTC timestamp.'},
+                            'files': {'type': 'array', 'items': _FILE_OUT},
+                            'progress': {'type': 'number'},
+                            'message': {'type': 'string'},
+                            'error': {'type': 'string'},
+                        },
+                        'required': ['task_id', 'status', 'modified', 'files'],
+                    },
+                },
+                'count': {'type': 'integer'},
+            },
+            'required': ['downloads', 'count'],
+        },
+        'annotations': dict(_READS_TASKS, title='List downloads'),
+    },
+    {
+        'name': 'delete_download',
+        'title': 'Delete a download',
+        'description': 'Delete a finished job\'s files from the server. Running jobs cannot be deleted.',
+        'inputSchema': {'type': 'object', 'properties': {'task_id': _TASK_ID_ARG}, 'required': ['task_id']},
+        'outputSchema': {
+            'type': 'object',
+            'properties': {
+                'task_id': {'type': 'string'},
+                'deleted': {'type': 'boolean', 'description': 'False if there was nothing to delete.'},
+            },
+            'required': ['task_id', 'deleted'],
+        },
+        'annotations': {'title': 'Delete a download', 'readOnlyHint': False, 'destructiveHint': True,
+                        'idempotentHint': True, 'openWorldHint': False},
+    },
+]
+
+# name -> (implementation, long_running). Long-running tools answer over SSE when the
+# client accepts it, so progress notifications can flow while they wait.
+MCP_TOOLS = {
+    'get_video_info': (tool_get_video_info, False),
+    'download_audio': (tool_download_audio, True),
+    'download_video': (tool_download_video, True),
+    'transcribe_video': (tool_transcribe_video, True),
+    'get_task_status': (tool_get_task_status, True),
+    'get_transcript': (tool_get_transcript, False),
+    'list_downloads': (tool_list_downloads, False),
+    'delete_download': (tool_delete_download, False),
+}
+assert [t['name'] for t in MCP_TOOL_DEFS] == list(MCP_TOOLS)
+
+
+def _run_tool(name, args, ctx):
+    """Run a tool and build its CallToolResult."""
+    implementation, _ = MCP_TOOLS[name]
+    try:
+        structured = implementation(args, ctx)
+    except ClientGone:
+        raise
+    except ToolError as e:
+        return {'content': [{'type': 'text', 'text': str(e)}], 'isError': True}
+    except Exception as e:
+        print(f'[MCP] {name} failed: {e!r}')
+        detail = str(e).strip()
+        if len(detail) > 2000:
+            detail = detail[-2000:]
+        return {'content': [{'type': 'text', 'text': f'{name} failed: {detail}'}], 'isError': True}
+    return {
+        'content': [{'type': 'text', 'text': json.dumps(structured, ensure_ascii=False, indent=2)}],
+        'structuredContent': structured,
+        'isError': structured.get('status') == 'error',
+    }
+
+
+# --- JSON-RPC over HTTP -------------------------------------------------------------
+
+def _rpc_error(req_id, code, message, data=None):
+    error = {'code': code, 'message': message}
+    if data is not None:
+        error['data'] = data
+    response = {'jsonrpc': '2.0', 'error': error}
+    if req_id is not None:
+        response['id'] = req_id
+    return response
+
+
+def _send_cors(handler, origin):
+    if origin:
+        handler.send_header('Access-Control-Allow-Origin', origin)
+        handler.send_header('Vary', 'Origin')
+        handler.send_header('Access-Control-Expose-Headers', 'WWW-Authenticate')
+
+
+def _mcp_send_json(handler, status, payload, origin, extra_headers=None):
+    body = b'' if payload is None else json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    handler.send_response(status)
+    if payload is not None:
+        handler.send_header('Content-Type', 'application/json')
+    handler.send_header('Content-Length', str(len(body)))
+    for name, value in (extra_headers or {}).items():
+        handler.send_header(name, value)
+    _send_cors(handler, origin)
+    handler.end_headers()
+    if body:
+        handler.wfile.write(body)
+
+
+class _SSEStream:
+    """A text/event-stream response scoped to one request."""
+
+    def __init__(self, handler, progress_token, origin):
+        self.handler = handler
+        self.token = progress_token
+        self.last_progress = -1.0
+        handler.send_response(200)
+        handler.send_header('Content-Type', 'text/event-stream')
+        handler.send_header('Cache-Control', 'no-cache')
+        handler.send_header('X-Accel-Buffering', 'no')
+        handler.send_header('Connection', 'close')
+        _send_cors(handler, origin)
+        handler.end_headers()
+        handler.close_connection = True
+
+    def _write(self, chunk):
+        try:
+            self.handler.wfile.write(chunk)
+            self.handler.wfile.flush()
+        except OSError as e:  # BrokenPipe, ConnectionReset, ConnectionAborted
+            raise ClientGone() from e
+
+    def send(self, message):
+        # ASCII-only: line splitters such as httpx's also break on U+2028, U+2029 and
+        # U+0085, which ensure_ascii=False would leave raw inside a video title.
+        data = json.dumps(message).encode('ascii')
+        self._write(b'event: message\ndata: ' + data + b'\n\n')
+
+    def progress(self, value, message):
+        if self.token is None:
+            # No progressToken: send an SSE comment, which keeps proxies from idling the
+            # connection out and surfaces a client disconnect.
+            self._write(b': keepalive\n\n')
+            return
+        # Progress must strictly increase, even when a phase reports no movement.
+        value = round(max(value, self.last_progress + 0.01), 2)
+        self.last_progress = value
+        self.send({'jsonrpc': '2.0', 'method': 'notifications/progress',
+                   'params': {'progressToken': self.token, 'progress': value, 'total': 100,
+                              'message': message}})
+
+
+def _decode_header_value(value):
+    """Undo the =?base64?...?= sentinel encoding used for non-ASCII Mcp-Name values."""
+    if value.startswith('=?base64?') and value.endswith('?=') and len(value) >= 11:
+        try:
+            return base64.b64decode(value[9:-2], validate=True).decode('utf-8')
+        except (ValueError, UnicodeDecodeError):
+            return None
+    return value
+
+
+def _check_mirrored_header(headers, name, expected, decode=False):
+    value = headers.get(name)
+    if value is None:
+        raise McpError(-32020, f'Header mismatch: required header {name} is missing', 400)
+    if decode:
+        value = _decode_header_value(value)
+        if value is None:
+            raise McpError(-32020, f'Header mismatch: {name} header is not valid base64', 400)
+    if value != expected:
+        raise McpError(-32020, f'Header mismatch: {name} header value {value!r} does not match '
+                       f'body value {expected!r}', 400)
+
+
+def _check_request_version(headers, method, params):
+    """Validate protocol metadata and return True for a modern (2026-07-28) request."""
+    meta = params.get('_meta')
+    if meta is not None and not isinstance(meta, dict):
+        raise McpError(-32602, '_meta must be an object', 400)
+    meta = meta or {}
+    header_version = headers.get('MCP-Protocol-Version')
+    body_version = meta.get(META_PROTOCOL_VERSION)
+
+    if body_version is None and header_version not in MCP_MODERN_VERSIONS:
+        # Legacy era: the version is the negotiated one in the header (absent means
+        # 2025-03-26) and requests carry no _meta to validate.
+        if header_version is not None and header_version not in MCP_LEGACY_VERSIONS:
+            raise McpError(-32022, 'Unsupported protocol version', 400,
+                           {'supported': MCP_SUPPORTED_VERSIONS, 'requested': header_version})
+        return False
+
+    if not isinstance(body_version, str):
+        raise McpError(-32602, f'Missing required _meta field {META_PROTOCOL_VERSION}', 400)
+    if not isinstance(meta.get(META_CLIENT_CAPABILITIES), dict):
+        raise McpError(-32602, f'Missing required _meta field {META_CLIENT_CAPABILITIES}', 400)
+    _check_mirrored_header(headers, 'MCP-Protocol-Version', body_version)
+    if body_version not in MCP_SUPPORTED_VERSIONS:
+        raise McpError(-32022, 'Unsupported protocol version', 400,
+                       {'supported': MCP_SUPPORTED_VERSIONS, 'requested': body_version})
+    _check_mirrored_header(headers, 'Mcp-Method', method)
+    if method in ('tools/call', 'prompts/get'):
+        _check_mirrored_header(headers, 'Mcp-Name', params.get('name'), decode=True)
+    elif method == 'resources/read':
+        _check_mirrored_header(headers, 'Mcp-Name', params.get('uri'), decode=True)
+    return body_version in MCP_MODERN_VERSIONS
+
+
+def _shape_result(result, modern):
+    """Modern results carry resultType and identify the server in _meta."""
+    if not modern:
+        return result
+    shaped = {'resultType': 'complete'}
+    shaped.update(result)
+    meta = dict(shaped.get('_meta') or {})
+    meta[META_SERVER_INFO] = SERVER_INFO
+    shaped['_meta'] = meta
+    return shaped
+
+
+def _mcp_tools_call(handler, req_id, params, modern, origin):
+    name = params.get('name')
+    if not isinstance(name, str) or name not in MCP_TOOLS:
+        raise McpError(-32602, f'Unknown tool: {name}')
+    args = params.get('arguments')
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        raise McpError(-32602, 'arguments must be an object')
+    token = (params.get('_meta') or {}).get('progressToken')
+    if isinstance(token, bool) or not isinstance(token, (str, int)):
+        token = None
+
+    stream = None
+    if MCP_TOOLS[name][1] and 'text/event-stream' in (handler.headers.get('Accept') or ''):
+        stream = _SSEStream(handler, token, origin)
+    ctx = {
+        'base_url': request_base_url(handler.headers),
+        'progress': stream.progress if stream else None,
+        'alive': lambda: client_connected(handler),
+    }
+    response = {'jsonrpc': '2.0', 'id': req_id, 'result': _shape_result(_run_tool(name, args, ctx), modern)}
+    if stream:
+        stream.send(response)
+    else:
+        _mcp_send_json(handler, 200, response, origin)
+
+
+def handle_mcp_post(handler):
+    """POST /mcp: one JSON-RPC request or notification per HTTP request."""
+    origin = handler.headers.get('Origin')
+    cors = origin if mcp_origin_allowed(origin) else None
+    # Read the body before any early rejection: closing with unread request bytes makes
+    # the kernel send a TCP RST, and the client never sees the 401/403.
+    try:
+        length = int(handler.headers.get('Content-Length', ''))
+    except ValueError:
+        _mcp_send_json(handler, 411, _rpc_error(None, -32600, 'Content-Length required'), cors)
+        return
+    if length < 0 or length > MCP_MAX_BODY_BYTES:
+        _mcp_send_json(handler, 413, _rpc_error(None, -32600, 'Request body too large'), cors)
+        return
+    body = handler.rfile.read(length)
+
+    if cors is None and origin is not None:
+        _mcp_send_json(handler, 403, _rpc_error(None, -32600, 'Origin not allowed'), None)
+        return
+    if MCP_CONFIG_ERROR:
+        _mcp_send_json(handler, 503, _rpc_error(None, -32603, 'MCP server is misconfigured; see server log'),
+                       origin)
+        return
+    try:
+        mcp_authorize(handler.headers)
+    except AuthFailure as e:
+        _mcp_send_json(handler, e.status, {'error': e.error, 'error_description': e.description}, origin,
+                       {'WWW-Authenticate': e.challenge} if e.challenge else None)
+        return
+
+    try:
+        message = json.loads(body.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError):
+        _mcp_send_json(handler, 400, _rpc_error(None, -32700, 'Parse error'), origin)
+        return
+
+    if isinstance(message, list):
+        _mcp_send_json(handler, 400, _rpc_error(None, -32600, 'Batch requests are not supported'), origin)
+        return
+    if not isinstance(message, dict) or message.get('jsonrpc') != '2.0':
+        _mcp_send_json(handler, 400, _rpc_error(None, -32600, 'Invalid Request'), origin)
+        return
+    method = message.get('method')
+    if method is None or 'id' not in message:
+        # A notification (e.g. legacy notifications/initialized), or a response to a
+        # server request - this server never sends any. Either way there is nothing to answer.
+        _mcp_send_json(handler, 202, None, origin)
+        return
+    req_id = message['id']
+    if not isinstance(method, str) or isinstance(req_id, bool) or not isinstance(req_id, (str, int)):
+        _mcp_send_json(handler, 400, _rpc_error(None, -32600, 'Invalid Request'), origin)
+        return
+    params = message.get('params')
+    if params is None:
+        params = {}
+
+    try:
+        if not isinstance(params, dict):
+            raise McpError(-32602, 'params must be an object', 400)
+        modern = _check_request_version(handler.headers, method, params)
+        if method == 'tools/call':
+            _mcp_tools_call(handler, req_id, params, modern, origin)
+            return
+        if method == 'initialize' and not modern:
+            requested = params.get('protocolVersion')
+            result = {
+                'protocolVersion': requested if requested in MCP_LEGACY_VERSIONS else MCP_LEGACY_VERSIONS[0],
+                'capabilities': MCP_CAPABILITIES,
+                'serverInfo': SERVER_INFO,
+                'instructions': MCP_INSTRUCTIONS,
             }
+        elif method == 'server/discover':
+            result = {'supportedVersions': MCP_SUPPORTED_VERSIONS, 'capabilities': MCP_CAPABILITIES,
+                      'instructions': MCP_INSTRUCTIONS, **MCP_CACHE_HINTS}
+        elif method == 'ping':
+            result = {}
+        elif method == 'tools/list':
+            result = {'tools': MCP_TOOL_DEFS}
+            if modern:
+                result.update(MCP_CACHE_HINTS)
+        else:
+            # The modern transport signals an unknown method with HTTP 404; legacy clients
+            # expect the JSON-RPC error on a 200.
+            raise McpError(-32601, f'Method not found: {method}', 404 if modern else 200)
+        _mcp_send_json(handler, 200, {'jsonrpc': '2.0', 'id': req_id, 'result': _shape_result(result, modern)},
+                       origin)
+    except McpError as e:
+        _mcp_send_json(handler, e.http_status, _rpc_error(req_id, e.code, e.message, e.data), origin)
+    except ClientGone:
+        print(f'[MCP] Client closed the stream for request {req_id!r}; any started job keeps running.')
+
+
+def handle_mcp_preflight(handler):
+    """CORS preflight for browser-based MCP clients (e.g. MCP Inspector)."""
+    origin = handler.headers.get('Origin')
+    if not mcp_origin_allowed(origin):
+        handler.send_response(403)
+        handler.send_header('Content-Length', '0')
+        handler.end_headers()
+        return
+    handler.send_response(204)
+    if origin:
+        handler.send_header('Access-Control-Allow-Origin', origin)
+        handler.send_header('Vary', 'Origin')
+        handler.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        handler.send_header('Access-Control-Allow-Headers',
+                            handler.headers.get('Access-Control-Request-Headers')
+                            or 'Content-Type, Authorization, MCP-Protocol-Version, Mcp-Method, Mcp-Name')
+        handler.send_header('Access-Control-Max-Age', '600')
+    handler.send_header('Content-Length', '0')
+    handler.end_headers()
+
+
+def send_mcp_method_not_allowed(handler):
+    """GET and DELETE on /mcp: no standalone SSE stream and no sessions to terminate."""
+    handler.send_response(405)
+    handler.send_header('Allow', 'POST, OPTIONS')
+    handler.send_header('Content-Length', '0')
+    handler.end_headers()
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -1711,6 +3062,21 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if MCP_ENABLED and path in MCP_PATHS:
+            send_mcp_method_not_allowed(self)
+            return
+
+        # OAuth 2.0 Protected Resource Metadata (RFC 9728), only when MCP_AUTH=oauth
+        if MCP_ENABLED and MCP_AUTH == 'oauth' and not MCP_CONFIG_ERROR and path in MCP_PRM_PATHS:
+            body = json.dumps(protected_resource_metadata()).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
+            return
         
         # Serve main page
         if path == '/' or path == '/index.html':
@@ -1782,6 +3148,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_error(404, 'Not found')
     
     def do_POST(self):
+        if MCP_ENABLED and urlparse(self.path).path in MCP_PATHS:
+            handle_mcp_post(self)
+            return
+
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length)
 
@@ -1822,25 +3192,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_json({'error': 'Invalid YouTube URL'}, 400)
                     return
 
-                # Validate bitrate
-                valid_bitrates = ['320', '256', '192', '128', '96', '64']
-                if bitrate not in valid_bitrates:
-                    bitrate = '320'
-
-                # Create task
-                task_id = str(uuid.uuid4())[:8]
-
-                if transcribe:
-                    whisper_acquire()
-
-                # Start conversion in background thread
-                thread = threading.Thread(
-                    target=download_and_convert,
-                    args=(task_id, canonical_youtube_url(video_id), bitrate, transcribe, timestamps)
-                )
-                thread.daemon = True
-                thread.start()
-
+                task_id = start_audio_task(video_id, bitrate, transcribe, timestamps)
                 self.send_json({'task_id': task_id, 'status': 'started'})
 
             except json.JSONDecodeError:
@@ -1864,25 +3216,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.send_json({'error': 'Invalid YouTube URL'}, 400)
                     return
 
-                # Validate resolution
-                valid_resolutions = ['2160', '1440', '1080', '720', '480', '360']
-                if resolution not in valid_resolutions:
-                    resolution = '1080'
-
-                # Create task
-                task_id = str(uuid.uuid4())[:8]
-
-                if transcribe:
-                    whisper_acquire()
-
-                # Start video download in background thread
-                thread = threading.Thread(
-                    target=download_video,
-                    args=(task_id, canonical_youtube_url(video_id), resolution, transcribe, timestamps)
-                )
-                thread.daemon = True
-                thread.start()
-
+                task_id = start_video_task(video_id, resolution, transcribe, timestamps)
                 self.send_json({'task_id': task_id, 'status': 'started'})
 
             except json.JSONDecodeError:
@@ -1895,6 +3229,9 @@ class RequestHandler(BaseHTTPRequestHandler):
     
     def do_OPTIONS(self):
         """Handle CORS preflight."""
+        if MCP_ENABLED and urlparse(self.path).path in MCP_PATHS:
+            handle_mcp_preflight(self)
+            return
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
@@ -1905,6 +3242,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         """Handle DELETE requests."""
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if MCP_ENABLED and path in MCP_PATHS:
+            send_mcp_method_not_allowed(self)
+            return
 
         # API: Delete a task's files
         if path.startswith('/api/delete/'):
@@ -1931,22 +3272,27 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 
 def cleanup_old_downloads():
-    """Clean up downloads older than 1 hour."""
-    import time
+    """Delete downloads that finished more than an hour ago."""
     while True:
         time.sleep(3600)  # Check every hour
+        cutoff = time.time() - 3600
         try:
-            cutoff = time.time() - 3600
-            for task_dir in DOWNLOAD_DIR.iterdir():
-                if task_dir.is_dir():
-                    if task_dir.stat().st_mtime < cutoff:
-                        shutil.rmtree(task_dir)
-                        with downloads_lock:
-                            task_id = task_dir.name
-                            if task_id in active_downloads:
-                                del active_downloads[task_id]
-        except Exception:
-            pass
+            task_dirs = [d for d in DOWNLOAD_DIR.iterdir() if d.is_dir()]
+        except OSError:
+            continue
+        for task_dir in task_dirs:
+            try:
+                with downloads_lock:
+                    # A long CPU transcription can outlive the window; never pull the files
+                    # out from under a job that is still running.
+                    if active_downloads.get(task_dir.name, {}).get('status') == 'processing':
+                        continue
+                if task_dir.stat().st_mtime < cutoff:
+                    shutil.rmtree(task_dir)
+                    with downloads_lock:
+                        active_downloads.pop(task_dir.name, None)
+            except OSError:
+                pass
 
 
 def main():
@@ -1970,6 +3316,18 @@ def main():
     print(f"   Local:   http://localhost:{EXTERNAL_PORT}")
     print(f"   Network: http://{local_ip}:{EXTERNAL_PORT}")
     print(f"\nShare the Network URL with others on your network")
+    if MCP_ENABLED:
+        print(f"\nMCP server (Streamable HTTP, protocol {MCP_MODERN_VERSIONS[0]} + legacy {MCP_LEGACY_VERSIONS[-1]}..{MCP_LEGACY_VERSIONS[0]}):")
+        print(f"   Endpoint: http://localhost:{EXTERNAL_PORT}/mcp")
+        print(f"   Auth:     {MCP_AUTH}")
+        if MCP_CONFIG_ERROR:
+            print(f"   [ERROR] {MCP_CONFIG_ERROR} - /mcp refuses every request until this is fixed")
+        elif MCP_AUTH == 'token' and len(MCP_AUTH_TOKEN) < 32:
+            print("   [WARN] MCP_AUTH_TOKEN is short; use at least 32 random characters")
+        if MCP_AUTH != 'off':
+            print("   [WARN] MCP_AUTH protects /mcp only. The web UI and /api/* on this port are still")
+            print("          open. Beyond your LAN, expose only /mcp, /.well-known/oauth-protected-resource*")
+            print("          and /download/ through your reverse proxy.")
     print(f"\nPress Ctrl+C to stop the server\n")
     print("=" * 50)
 

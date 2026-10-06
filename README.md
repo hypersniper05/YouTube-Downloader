@@ -20,6 +20,7 @@ A self-hosted web server that downloads YouTube videos as MP3 audio or MP4 video
 - **File Size Estimates** - See approximate file size before download
 - **Auto-cleanup** - Old downloads removed after 1 hour
 - **GPU Optimized** - Runs on NVIDIA GPUs via CUDA for fast transcription
+- **MCP Server** - AI assistants such as Claude can download and transcribe videos over the [Model Context Protocol](#mcp-server-ai-assistants)
 
 ## Quick Start
 
@@ -148,6 +149,17 @@ ports:
 | `EXTERNAL_PORT` | `8080` | Port displayed in server startup message |
 | `WHISPER_MODEL_ID` | `openai/whisper-large-v3-turbo` | Whisper model to use |
 | `WHISPER_MODEL_DIR` | `/app/whisper-model` | Directory to cache model weights |
+| `YTDLP_AUTO_UPDATE` | `1` | Refresh yt-dlp on every container start |
+| `MCP_ENABLED` | `1` | Serve the MCP endpoint at `/mcp` |
+| `MCP_AUTH` | `off` | `off`, `token` or `oauth` - see [Authorization](#authorization) |
+| `MCP_AUTH_TOKEN` | - | Bearer token for `MCP_AUTH=token` |
+| `PUBLIC_BASE_URL` | - | External URL, e.g. `https://ytdl.example.com`. Used for download links; required for `oauth` |
+| `MCP_OAUTH_ISSUER` | - | Authorization server issuer URL (`oauth`) |
+| `MCP_OAUTH_INTROSPECTION_URL` | - | Token introspection endpoint (`oauth`) |
+| `MCP_OAUTH_CLIENT_ID`, `MCP_OAUTH_CLIENT_SECRET` | - | Credentials ytdl-web uses to call the introspection endpoint (`oauth`) |
+| `MCP_OAUTH_SCOPES` | - | Space-separated scopes a token must have (`oauth`) |
+| `MCP_ALLOWED_ORIGINS` | - | Comma-separated extra browser origins allowed to call `/mcp` |
+| `MCP_MAX_ACTIVE_JOBS` | `4` | Jobs that may run at once before MCP clients get "Server busy" |
 
 ### Available Whisper Models
 
@@ -172,6 +184,84 @@ ports:
 | `/api/file-exists/:id` | GET | Check if download file exists |
 | `/api/delete/:id` | DELETE | Delete a download |
 | `/download/:id/:file` | GET | Download completed file (MP3, MP4, TXT, or SRT) |
+| `/mcp` | POST | MCP server endpoint - see [MCP Server](#mcp-server-ai-assistants) |
+
+## MCP Server (AI Assistants)
+
+ytdl-web is also an [MCP](https://modelcontextprotocol.io) server, so AI assistants such as Claude can look up,
+download and transcribe videos for you. It listens at `/mcp` on the same port as the web UI.
+
+- **Protocol** - Streamable HTTP, revision `2026-07-28`, plus the earlier `initialize`-based revisions
+  (`2025-03-26` to `2025-11-25`) that most clients still use. Stateless: no sessions are kept.
+- **Long jobs** - Downloads and transcription run in the background. Each tool waits up to `wait_seconds`
+  (default 45, max 600) and streams progress notifications while it waits. If the job is still running after
+  that, the tool returns a `task_id`, and the assistant polls it with `get_task_status`. Transcription can take
+  several minutes for a long video when Whisper runs on the CPU.
+
+### Tools
+
+| Tool | What it does |
+|------|--------------|
+| `get_video_info` | Title, channel, duration, thumbnail, and the resolutions and bitrates you can request |
+| `download_audio` | MP3 at 64-320 kbps, optionally transcribed to plain text or SRT |
+| `download_video` | MP4 at 360p-4K, optionally transcribed to plain text or SRT |
+| `transcribe_video` | Transcript only: SRT subtitles (default) or plain text, returned inline with a link to the file |
+| `get_task_status` | Check on, or wait for, a running job |
+| `get_transcript` | Full transcript text of a finished job |
+| `list_downloads` | Jobs whose files are still on the server, newest first |
+| `delete_download` | Delete a finished job's files |
+
+Every tool returns structured output that matches its published `outputSchema`, with direct download links.
+Files are deleted 1-2 hours after the job finishes.
+
+### Connecting a client
+
+Claude Code:
+
+```bash
+claude mcp add --transport http ytdl http://localhost:6080/mcp
+```
+
+With a bearer token (see [Authorization](#authorization)):
+
+```bash
+claude mcp add --transport http ytdl http://localhost:6080/mcp --header "Authorization: Bearer YOUR_TOKEN"
+```
+
+Any MCP client that supports Streamable HTTP can connect to `http://<host>:6080/mcp`.
+
+### Authorization
+
+Off by default. Choose a mode with `MCP_AUTH`:
+
+| Mode | Use it when | Settings |
+|------|-------------|----------|
+| `off` | The server stays on a trusted LAN | - |
+| `token` | You configure the client yourself, e.g. Claude Code's `--header` | `MCP_AUTH_TOKEN` (32+ random characters) |
+| `oauth` | The client discovers auth on its own, e.g. claude.ai custom connectors | `PUBLIC_BASE_URL`, `MCP_OAUTH_ISSUER`, `MCP_OAUTH_INTROSPECTION_URL`, `MCP_OAUTH_CLIENT_ID`, `MCP_OAUTH_CLIENT_SECRET`, optionally `MCP_OAUTH_SCOPES` |
+
+Generate a token with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+
+In `oauth` mode ytdl-web is an OAuth 2.1 *resource server*; you run the authorization server (Keycloak,
+Authentik, Auth0, ...). ytdl-web:
+
+- publishes Protected Resource Metadata (RFC 9728) at `/.well-known/oauth-protected-resource/mcp`
+- validates each token at the authorization server's introspection endpoint (RFC 7662), caching the answer
+  for up to 60 seconds
+- accepts only tokens issued for `PUBLIC_BASE_URL/mcp` or `PUBLIC_BASE_URL` (audience check, RFC 8707)
+- answers `403 insufficient_scope` when a token lacks a scope listed in `MCP_OAUTH_SCOPES`
+
+If the chosen mode is missing a setting, `/mcp` refuses every request and the startup log says what is
+missing. The web UI keeps working.
+
+> **`MCP_AUTH` protects `/mcp` only.** The web UI, `/api/*` and `/download/` have no authentication, as
+> before. Before exposing the server beyond your LAN, put it behind a reverse proxy that forwards only `/mcp`,
+> `/.well-known/oauth-protected-resource*` and `/download/`. Download links carry no credentials so that MCP
+> clients can fetch them directly; they use random task ids and expire after 1-2 hours.
+
+Browser-based clients such as MCP Inspector must come from a loopback origin, from `PUBLIC_BASE_URL`, or from
+an origin in `MCP_ALLOWED_ORIGINS`. Any other origin gets 403, which blocks DNS-rebinding attacks. Native
+clients send no `Origin` header and are not affected.
 
 ## GPU Requirements
 
@@ -196,6 +286,8 @@ Transcription falls back to CPU if no GPU is available, but will be significantl
 | Transcription fails with CUDA error | Ensure PyTorch version matches your GPU architecture |
 | Model download slow | First run downloads ~1.6 GB; subsequent runs use cache |
 | GPU not detected | Check `nvidia-smi` works and Container Toolkit is installed |
+| MCP client gets 401 | `MCP_AUTH` is on: send `Authorization: Bearer <token>` (`token`), or let the client complete the OAuth flow (`oauth`) |
+| MCP tool returns `"status": "processing"` | Normal for long jobs: the assistant calls `get_task_status` with the `task_id` |
 
 ## Updating
 

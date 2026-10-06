@@ -17,6 +17,16 @@ services:
       # Refresh yt-dlp on every container start. YouTube breaks extraction every few
       # weeks; this makes `docker compose restart` the fix. Set to 0 to pin to the image.
       - YTDLP_AUTO_UPDATE=1
+      # MCP server for AI assistants at http://<host>:6080/mcp - see README "MCP Server".
+      # No auth by default, which is the same exposure as the web UI. For a bearer token:
+      #   MCP_AUTH=token and MCP_AUTH_TOKEN=<32+ random chars>
+      # For OAuth (e.g. claude.ai connectors), see README for MCP_AUTH=oauth.
+      # MCP_AUTH protects /mcp only - the web UI and /api/* stay open.
+      - MCP_ENABLED=1
+      - MCP_AUTH=off
+      # - MCP_AUTH_TOKEN=
+      # Public URL when behind a reverse proxy; used for download links and OAuth.
+      # - PUBLIC_BASE_URL=https://ytdl.example.com
     # Enable NVIDIA GPU access
     deploy:
       resources:
