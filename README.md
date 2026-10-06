@@ -20,8 +20,8 @@ A self-hosted server that downloads YouTube videos as MP3 or MP4 files. It can a
 You need Docker. An NVIDIA GPU makes transcription faster, but it is not necessary.
 
 ```bash
-git clone https://github.com/hypersniper05/ytdl-web.git
-cd ytdl-web
+git clone https://github.com/hypersniper05/mcp-youtube-downloader.git
+cd mcp-youtube-downloader
 docker compose up -d
 ```
 
