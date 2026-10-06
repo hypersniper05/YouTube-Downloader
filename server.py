@@ -1452,6 +1452,57 @@ def _finish_task(task_id, record):
         active_downloads[task_id] = record
 
 
+# YouTube intermittently refuses a freshly issued stream URL with HTTP 403 on the very first
+# request - more often after a burst of downloads. yt-dlp treats that as fatal, but a new
+# extraction gets a new URL that almost always works (yt-dlp issue #17395, closed as an
+# external issue). So a 403 is retried with a fresh yt-dlp run.
+try:
+    YTDLP_403_RETRIES = max(0, int(os.environ.get('YTDLP_403_RETRIES', '3')))
+except ValueError:
+    YTDLP_403_RETRIES = 3
+
+
+def run_ytdlp(task_id, cmd, timeout, downloading_message, finishing_message):
+    """Run yt-dlp, publishing its progress to the task. Raises if it fails."""
+    attempts = 1 + YTDLP_403_RETRIES
+    for attempt in range(1, attempts + 1):
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+        # Read output line by line for real-time progress
+        last_lines = []
+        for line in iter(process.stdout.readline, ''):
+            if not line:
+                break
+            last_lines.append(line.strip())
+            if len(last_lines) > 15:
+                last_lines.pop(0)
+            progress = parse_progress(line)
+            if progress is not None:
+                with downloads_lock:
+                    active_downloads[task_id]['progress'] = progress
+                    if progress < 100:
+                        active_downloads[task_id]['message'] = f'{downloading_message} {progress:.1f}%'
+                    else:
+                        active_downloads[task_id]['message'] = finishing_message
+
+        process.wait(timeout=timeout)
+        if process.returncode == 0:
+            return
+
+        error_detail = '\n'.join(last_lines[-5:]) if last_lines else 'No output captured'
+        if 'HTTP Error 403' not in error_detail or attempt == attempts:
+            if attempt > 1:
+                error_detail += f'\n(YouTube refused the stream on all {attempt} attempts)'
+            raise Exception(f"yt-dlp download failed:\n{error_detail}")
+
+        print(f"[yt-dlp] Task {task_id}: YouTube refused the stream (HTTP 403); "
+              f"retrying with a fresh link ({attempt + 1}/{attempts})")
+        with downloads_lock:
+            active_downloads[task_id]['message'] = (f'YouTube refused the stream; retrying with a fresh '
+                                                    f'link ({attempt + 1}/{attempts})...')
+        time.sleep(2 * attempt)
+
+
 def download_and_convert(task_id, url, bitrate='320', transcribe=False, timestamps=False):
     """Download YouTube video and convert to MP3, optionally transcribe."""
     try:
@@ -1504,37 +1555,7 @@ def download_and_convert(task_id, url, bitrate='320', transcribe=False, timestam
             active_downloads[task_id]['message'] = 'Downloading...'
             active_downloads[task_id]['progress'] = 0
 
-        # Run yt-dlp with real-time progress capture
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
-
-        # Read output line by line for real-time progress
-        last_lines = []
-        for line in iter(process.stdout.readline, ''):
-            if not line:
-                break
-            last_lines.append(line.strip())
-            if len(last_lines) > 15:
-                last_lines.pop(0)
-            progress = parse_progress(line)
-            if progress is not None:
-                with downloads_lock:
-                    active_downloads[task_id]['progress'] = progress
-                    if progress < 100:
-                        active_downloads[task_id]['message'] = f'Downloading... {progress:.1f}%'
-                    else:
-                        active_downloads[task_id]['message'] = 'Converting to MP3...'
-
-        process.wait(timeout=300)
-
-        if process.returncode != 0:
-            error_detail = '\n'.join(last_lines[-5:]) if last_lines else 'No output captured'
-            raise Exception(f"yt-dlp download failed:\n{error_detail}")
+        run_ytdlp(task_id, cmd, 300, 'Downloading...', 'Converting to MP3...')
 
         # Find the MP3 file
         mp3_files = list(task_dir.glob('*.mp3'))
@@ -1625,37 +1646,7 @@ def download_video(task_id, url, resolution='1080', transcribe=False, timestamps
             active_downloads[task_id]['message'] = 'Downloading video...'
             active_downloads[task_id]['progress'] = 0
 
-        # Run yt-dlp with real-time progress capture
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
-
-        # Read output line by line for real-time progress
-        last_lines = []
-        for line in iter(process.stdout.readline, ''):
-            if not line:
-                break
-            last_lines.append(line.strip())
-            if len(last_lines) > 15:
-                last_lines.pop(0)
-            progress = parse_progress(line)
-            if progress is not None:
-                with downloads_lock:
-                    active_downloads[task_id]['progress'] = progress
-                    if progress < 100:
-                        active_downloads[task_id]['message'] = f'Downloading video... {progress:.1f}%'
-                    else:
-                        active_downloads[task_id]['message'] = 'Merging video and audio...'
-
-        process.wait(timeout=600)
-
-        if process.returncode != 0:
-            error_detail = '\n'.join(last_lines[-5:]) if last_lines else 'No output captured'
-            raise Exception(f"yt-dlp download failed:\n{error_detail}")
+        run_ytdlp(task_id, cmd, 600, 'Downloading video...', 'Merging video and audio...')
 
         # Find the video file
         video_files = list(task_dir.glob('*.mp4')) + list(task_dir.glob('*.mkv')) + list(task_dir.glob('*.webm'))
