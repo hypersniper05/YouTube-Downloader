@@ -21,12 +21,15 @@ services:
       # No auth by default, which is the same exposure as the web UI. For a bearer token:
       #   MCP_AUTH=token and MCP_AUTH_TOKEN=<32+ random chars>
       # For OAuth (e.g. claude.ai connectors), see README for MCP_AUTH=oauth.
-      # MCP_AUTH protects /mcp only - the web UI and /api/* stay open.
+      # MCP_AUTH protects /mcp only; WEB_AUTH_PASSWORD (below) protects the web UI and /api/*.
       - MCP_ENABLED=1
       - MCP_AUTH=off
       # - MCP_AUTH_TOKEN=
       # Public URL when behind a reverse proxy; used for download links and OAuth.
       # - PUBLIC_BASE_URL=https://ytdl.example.com
+      # Optional login for the web UI and /api/* (HTTP Basic). No auth when unset.
+      # - WEB_AUTH_PASSWORD=
+      # - WEB_AUTH_USER=admin
     # Enable NVIDIA GPU access
     deploy:
       resources:

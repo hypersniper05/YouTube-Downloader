@@ -43,6 +43,12 @@ EXTERNAL_PORT = int(os.environ.get('EXTERNAL_PORT', PORT))
 DOWNLOAD_DIR = Path(__file__).parent / 'downloads'
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
+# Optional HTTP Basic auth for the web UI and /api - off unless WEB_AUTH_PASSWORD is set.
+# /download/ stays open so MCP clients can fetch the links they are handed (random task ids,
+# deleted after 1-2 hours); /mcp has its own MCP_AUTH setting.
+WEB_AUTH_USER = os.environ.get('WEB_AUTH_USER', 'admin')
+WEB_AUTH_PASSWORD = os.environ.get('WEB_AUTH_PASSWORD', '')
+
 # Track active downloads
 active_downloads = {}
 downloads_lock = threading.Lock()
@@ -3035,6 +3041,22 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+def web_auth_ok(headers):
+    """True when web UI auth is off, or the request carries the configured Basic credentials."""
+    if not WEB_AUTH_PASSWORD:
+        return True
+    scheme, _, value = (headers.get('Authorization') or '').partition(' ')
+    if scheme.lower() != 'basic':
+        return False
+    try:
+        user, sep, password = base64.b64decode(value.strip(), validate=True).decode('utf-8').partition(':')
+    except (ValueError, UnicodeDecodeError):
+        return False
+    user_ok = hmac.compare_digest(user.encode('utf-8'), WEB_AUTH_USER.encode('utf-8'))
+    password_ok = hmac.compare_digest(password.encode('utf-8'), WEB_AUTH_PASSWORD.encode('utf-8'))
+    return bool(sep) and user_ok and password_ok
+
+
 class RequestHandler(BaseHTTPRequestHandler):
     """Handle HTTP requests."""
     
@@ -3050,6 +3072,19 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
     
+    def require_web_auth(self, path):
+        """Gate the web UI and /api behind WEB_AUTH_PASSWORD. Sends the 401 and returns False on failure."""
+        if path.startswith('/download/') or web_auth_ok(self.headers):
+            return True
+        body = b'Authentication required'
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="ytdl-web", charset="UTF-8"')
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -3069,6 +3104,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         
+        if not self.require_web_auth(path):
+            return
+
         # Serve main page
         if path == '/' or path == '/index.html':
             self.send_response(200)
@@ -3143,8 +3181,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             handle_mcp_post(self)
             return
 
-        content_length = int(self.headers.get('Content-Length', 0))
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+        except ValueError:
+            content_length = -1
+        if content_length < 0 or content_length > MCP_MAX_BODY_BYTES:
+            self.send_json({'error': 'Request body too large or missing Content-Length'}, 413)
+            return
+        # Read the body before any auth rejection: closing with unread request bytes makes
+        # the kernel reset the connection, and the client never sees the 401.
         body = self.rfile.read(content_length)
+        if not self.require_web_auth(urlparse(self.path).path):
+            return
 
         # API: Get video info
         if self.path == '/api/info':
@@ -3238,6 +3286,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             send_mcp_method_not_allowed(self)
             return
 
+        if not self.require_web_auth(path):
+            return
+
         # API: Delete a task's files
         if path.startswith('/api/delete/'):
             task_id = path.split('/')[-1]
@@ -3307,6 +3358,12 @@ def main():
     print(f"   Local:   http://localhost:{EXTERNAL_PORT}")
     print(f"   Network: http://{local_ip}:{EXTERNAL_PORT}")
     print(f"\nShare the Network URL with others on your network")
+    if WEB_AUTH_PASSWORD:
+        print(f"\nWeb UI auth: on (HTTP Basic, user {WEB_AUTH_USER!r})")
+        if len(WEB_AUTH_PASSWORD) < 12:
+            print("   [WARN] WEB_AUTH_PASSWORD is short; use at least 12 characters")
+    else:
+        print("\nWeb UI auth: off (set WEB_AUTH_PASSWORD to require a login)")
     if MCP_ENABLED:
         print(f"\nMCP server (Streamable HTTP, protocol {MCP_MODERN_VERSIONS[0]} + legacy {MCP_LEGACY_VERSIONS[-1]}..{MCP_LEGACY_VERSIONS[0]}):")
         print(f"   Endpoint: http://localhost:{EXTERNAL_PORT}/mcp")
@@ -3315,10 +3372,9 @@ def main():
             print(f"   [ERROR] {MCP_CONFIG_ERROR} - /mcp refuses every request until this is fixed")
         elif MCP_AUTH == 'token' and len(MCP_AUTH_TOKEN) < 32:
             print("   [WARN] MCP_AUTH_TOKEN is short; use at least 32 random characters")
-        if MCP_AUTH != 'off':
-            print("   [WARN] MCP_AUTH protects /mcp only. The web UI and /api/* on this port are still")
-            print("          open. Beyond your LAN, expose only /mcp, /.well-known/oauth-protected-resource*")
-            print("          and /download/ through your reverse proxy.")
+        if MCP_AUTH != 'off' and not WEB_AUTH_PASSWORD:
+            print("   [WARN] MCP_AUTH protects /mcp only; the web UI and /api/* are still open.")
+            print("          Set WEB_AUTH_PASSWORD to protect them too.")
     print(f"\nPress Ctrl+C to stop the server\n")
     print("=" * 50)
 
