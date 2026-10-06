@@ -1,4 +1,4 @@
-# MCP YouTube Downloader
+# YouTube Downloader
 
 A self-hosted server that downloads YouTube videos as MP3 or MP4 files. It can also transcribe the audio to text or SRT subtitles with Whisper. Use it from the web page, or let an AI assistant such as Claude use it through MCP.
 
@@ -20,8 +20,8 @@ A self-hosted server that downloads YouTube videos as MP3 or MP4 files. It can a
 You need Docker. An NVIDIA GPU makes transcription faster, but it is not necessary.
 
 ```bash
-git clone https://github.com/hypersniper05/mcp-youtube-downloader.git
-cd mcp-youtube-downloader
+git clone https://github.com/hypersniper05/YouTube-Downloader.git
+cd YouTube-Downloader
 docker compose up -d
 ```
 
