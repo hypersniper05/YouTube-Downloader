@@ -32,6 +32,10 @@ RUN apt-get update && \
 # Set working directory
 WORKDIR /app
 
+# Ubuntu 22.04's pip (22.0.2) can no longer parse current PyPI metadata: its resolver crashes
+# with "'int' object has no attribute 'lower'" while installing transformers. Upgrade it first.
+RUN python -m pip install --no-cache-dir --upgrade pip && pip --version
+
 # Install Python dependencies
 # PyTorch nightly with CUDA 12.8 support (required for sm_120 / RTX 5090 Blackwell)
 RUN pip install --no-cache-dir \
