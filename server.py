@@ -1368,6 +1368,47 @@ def extract_video_id(url):
     return None
 
 
+def canonical_youtube_url(video_id):
+    """Build the URL handed to yt-dlp from a validated 11-char video id.
+
+    yt-dlp is never given the caller's raw string: extract_video_id() matches anywhere
+    in its input, so a value like '--exec=... youtube.com/watch?v=<id>' would otherwise
+    reach yt-dlp's argv and be parsed as an option.
+    """
+    return f'https://www.youtube.com/watch?v={video_id}'
+
+
+TASK_ID_RE = re.compile(r'^[0-9a-f]{8}$')
+
+
+def resolve_task_dir(task_id):
+    """Return the directory for task_id, or None if the id is malformed.
+
+    Task ids arrive straight from URL paths; anything other than the 8-hex-char id we
+    mint is rejected so it can never name a path outside DOWNLOAD_DIR. ('..' used to
+    resolve to /app, so DELETE /api/delete/.. would rmtree the whole app.)
+    """
+    if not isinstance(task_id, str) or not TASK_ID_RE.match(task_id):
+        return None
+    return DOWNLOAD_DIR / task_id
+
+
+def resolve_task_file(task_id, filename):
+    """Return the path of a file directly inside a task directory, or None."""
+    task_dir = resolve_task_dir(task_id)
+    if task_dir is None or not filename or filename in ('.', '..'):
+        return None
+    if any(c in filename for c in ('/', chr(92), chr(0))):  # slash, backslash, NUL
+        return None
+    path = task_dir / filename
+    try:
+        if path.resolve().parent != task_dir.resolve():
+            return None
+    except (OSError, ValueError):
+        return None
+    return path
+
+
 def get_video_info(url):
     """Get video title and duration using yt-dlp."""
     cmd = [
@@ -1697,9 +1738,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         # API: Check if file exists for a task
         if path.startswith('/api/file-exists/'):
-            task_id = path.split('/')[-1]
-            task_dir = DOWNLOAD_DIR / task_id
-            exists = task_dir.exists() and any(task_dir.iterdir()) if task_dir.exists() else False
+            task_dir = resolve_task_dir(path.split('/')[-1])
+            exists = task_dir is not None and task_dir.is_dir() and any(task_dir.iterdir())
             self.send_json({'exists': exists})
             return
 
@@ -1707,11 +1747,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path.startswith('/download/'):
             parts = path.split('/')
             if len(parts) >= 4:
-                task_id = parts[2]
                 filename = unquote('/'.join(parts[3:]))
-                filepath = DOWNLOAD_DIR / task_id / filename
-                
-                if filepath.exists():
+                filepath = resolve_task_file(parts[2], filename)
+
+                if filepath is not None and filepath.is_file():
                     self.send_response(200)
                     # Determine content type based on extension
                     ext = filepath.suffix.lower()
@@ -1759,7 +1798,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
 
                 # Get video info
-                info = get_video_info(url)
+                info = get_video_info(canonical_youtube_url(video_id))
                 self.send_json(info)
 
             except json.JSONDecodeError:
@@ -1797,7 +1836,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # Start conversion in background thread
                 thread = threading.Thread(
                     target=download_and_convert,
-                    args=(task_id, url, bitrate, transcribe, timestamps)
+                    args=(task_id, canonical_youtube_url(video_id), bitrate, transcribe, timestamps)
                 )
                 thread.daemon = True
                 thread.start()
@@ -1839,7 +1878,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 # Start video download in background thread
                 thread = threading.Thread(
                     target=download_video,
-                    args=(task_id, url, resolution, transcribe, timestamps)
+                    args=(task_id, canonical_youtube_url(video_id), resolution, transcribe, timestamps)
                 )
                 thread.daemon = True
                 thread.start()
@@ -1870,7 +1909,10 @@ class RequestHandler(BaseHTTPRequestHandler):
         # API: Delete a task's files
         if path.startswith('/api/delete/'):
             task_id = path.split('/')[-1]
-            task_dir = DOWNLOAD_DIR / task_id
+            task_dir = resolve_task_dir(task_id)
+            if task_dir is None:
+                self.send_json({'success': False, 'error': 'Invalid task id'}, 400)
+                return
 
             try:
                 if task_dir.exists():
