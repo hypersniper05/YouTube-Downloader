@@ -11,6 +11,7 @@ import sys
 import uuid
 import json
 import gc
+import collections
 import time
 import select
 import socket
@@ -140,10 +141,13 @@ def _seconds_to_srt_time(s):
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def transcribe_audio_file(audio_path, timestamps=False):
+def transcribe_audio_file(audio_path, timestamps=False, on_start=None):
     """Transcribe an audio file using Whisper. Queued via whisper_lock (one at a time).
-    If timestamps=True, returns SRT-formatted string. Otherwise plain text."""
+    If timestamps=True, returns SRT-formatted string. Otherwise plain text.
+    on_start() is called once this file's turn comes."""
     with whisper_lock:
+        if on_start is not None:
+            on_start()
         pipe = _load_whisper()
         result = pipe(audio_path, return_timestamps=True)
 
@@ -1448,6 +1452,15 @@ def get_video_info(url):
     }
 
 
+def _set_task_message(task_id, message, progress=None):
+    with downloads_lock:
+        entry = active_downloads.get(task_id)
+        if entry is not None:
+            entry['message'] = message
+            if progress is not None:
+                entry['progress'] = progress
+
+
 def _finish_task(task_id, record):
     """Publish a job's final state. The hourly cleanup's retention window starts now."""
     try:
@@ -1580,12 +1593,16 @@ def download_and_convert(task_id, url, bitrate='320', transcribe=False, timestam
 
         # Transcribe if requested
         if transcribe:
+            # Transcriptions run one at a time behind whisper_lock. Hand the download slot to
+            # the next job now, so plain downloads do not wait behind them.
+            release_job_slot(task_id)
             try:
-                with downloads_lock:
-                    active_downloads[task_id]['message'] = 'Transcribing audio with Whisper AI...'
-                    active_downloads[task_id]['progress'] = 98
+                _set_task_message(task_id, 'Waiting for another transcription to finish...'
+                                  if whisper_lock.locked() else 'Transcribing audio with Whisper AI...', 98)
 
-                text = transcribe_audio_file(str(mp3_file), timestamps=timestamps)
+                text = transcribe_audio_file(
+                    str(mp3_file), timestamps=timestamps,
+                    on_start=lambda: _set_task_message(task_id, 'Transcribing audio with Whisper AI...'))
 
                 ext = '.srt' if timestamps else '.txt'
                 transcript_name = mp3_file.stem + ext
@@ -1671,12 +1688,16 @@ def download_video(task_id, url, resolution='1080', transcribe=False, timestamps
 
         # Transcribe directly from the video file (Whisper/ffmpeg handles extraction)
         if transcribe:
+            # Transcriptions run one at a time behind whisper_lock. Hand the download slot to
+            # the next job now, so plain downloads do not wait behind them.
+            release_job_slot(task_id)
             try:
-                with downloads_lock:
-                    active_downloads[task_id]['message'] = 'Transcribing audio with Whisper AI...'
-                    active_downloads[task_id]['progress'] = 98
+                _set_task_message(task_id, 'Waiting for another transcription to finish...'
+                                  if whisper_lock.locked() else 'Transcribing audio with Whisper AI...', 98)
 
-                text = transcribe_audio_file(str(video_file), timestamps=timestamps)
+                text = transcribe_audio_file(
+                    str(video_file), timestamps=timestamps,
+                    on_start=lambda: _set_task_message(task_id, 'Transcribing audio with Whisper AI...'))
 
                 ext = '.srt' if timestamps else '.txt'
                 transcript_name = video_file.stem + ext
@@ -1703,27 +1724,109 @@ VALID_BITRATES = ['320', '256', '192', '128', '96', '64']
 VALID_RESOLUTIONS = ['2160', '1440', '1080', '720', '480', '360']
 
 
-def _start_task(target, video_id, quality, transcribe, timestamps):
-    task_id = str(uuid.uuid4())[:8]
-    # Registered before the thread starts, so a status check made immediately after
-    # (the MCP tools make one) can never see 'not_found'.
-    with downloads_lock:
-        active_downloads[task_id] = {'status': 'processing', 'progress': 0, 'message': 'Starting...'}
-    if transcribe:
-        whisper_acquire()
+def _env_count(name, default, minimum):
     try:
-        threading.Thread(
-            target=target,
-            args=(task_id, canonical_youtube_url(video_id), quality, bool(transcribe), bool(timestamps)),
-            daemon=True,
-        ).start()
-    except BaseException:
+        return max(minimum, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+# At most MAX_ACTIVE_JOBS jobs run at once, for the web page and MCP alike. More jobs wait in
+# a first-in, first-out queue and start as running jobs finish. MAX_QUEUED_JOBS is only a
+# backstop against a flood of requests.
+MAX_ACTIVE_JOBS = _env_count('MAX_ACTIVE_JOBS', 4, 1)
+MAX_QUEUED_JOBS = _env_count('MAX_QUEUED_JOBS', 100, 0)
+
+# Lock order: _queue_lock before downloads_lock, never the reverse.
+_queue_lock = threading.Lock()
+_job_queue = collections.deque()  # (task_id, target, args, transcribe) waiting for a slot
+_slot_holders = set()             # task ids of the jobs that hold a slot
+
+
+class QueueFull(Exception):
+    """MAX_QUEUED_JOBS jobs are already waiting."""
+
+
+def _update_queue_positions_locked():
+    """Tell each waiting job its place in line. Caller holds _queue_lock."""
+    with downloads_lock:
+        waiting = len(_job_queue)
+        for position, job in enumerate(_job_queue, start=1):
+            entry = active_downloads.get(job[0])
+            if entry is not None:
+                entry['message'] = f'Waiting in queue: {position} of {waiting}'
+                entry['queue_position'] = position
+
+
+def _dispatch_locked():
+    """Start waiting jobs while slots are free. Caller holds _queue_lock."""
+    while _job_queue and len(_slot_holders) < MAX_ACTIVE_JOBS:
+        job = _job_queue.popleft()
+        task_id, target, args, transcribe = job
+        _slot_holders.add(task_id)
+        try:
+            threading.Thread(target=_run_job, args=(target, args), daemon=True).start()
+        except RuntimeError as e:  # can't start new thread
+            _slot_holders.discard(task_id)
+            if _slot_holders:
+                # A running job dispatches again when it finishes. Retry then, instead of
+                # failing every waiting job on a momentary thread limit.
+                _job_queue.appendleft(job)
+                break
+            with downloads_lock:
+                active_downloads[task_id] = {'status': 'error', 'error': f'Could not start the job: {e}'}
+            if transcribe:
+                whisper_release()
+    _update_queue_positions_locked()
+
+
+def release_job_slot(task_id):
+    """Give a job's slot to the next job in line. Calling it again does nothing."""
+    with _queue_lock:
+        if task_id in _slot_holders:
+            _slot_holders.discard(task_id)
+            _dispatch_locked()
+
+
+def _run_job(target, args):
+    """Run one job, then hand its slot to the next job in line."""
+    try:
+        target(*args)
+    finally:
+        release_job_slot(args[0])
+
+
+def _start_task(target, video_id, quality, transcribe, timestamps):
+    """Run a job now if a slot is free, otherwise queue it. Returns the task id."""
+    task_id = str(uuid.uuid4())[:8]
+    args = (task_id, canonical_youtube_url(video_id), quality, bool(transcribe), bool(timestamps))
+    with _queue_lock:
+        if len(_slot_holders) >= MAX_ACTIVE_JOBS and len(_job_queue) >= MAX_QUEUED_JOBS:
+            raise QueueFull(f'The queue is full: {len(_job_queue)} jobs are already waiting. Try again later.')
+        # Registered before the job runs, so a status check made immediately after (the
+        # MCP tools make one) can never see 'not_found'.
+        with downloads_lock:
+            active_downloads[task_id] = {'status': 'processing', 'progress': 0, 'message': 'Starting...'}
+        if transcribe:
+            whisper_acquire()
+        _job_queue.append((task_id, target, args, bool(transcribe)))
+        _dispatch_locked()
+    return task_id
+
+
+def cancel_queued_task(task_id):
+    """Remove a job that has not started yet. Returns True if it was waiting in the queue."""
+    with _queue_lock:
+        job = next((j for j in _job_queue if j[0] == task_id), None)
+        if job is None:
+            return False
+        _job_queue.remove(job)
         with downloads_lock:
             active_downloads.pop(task_id, None)
-        if transcribe:
-            whisper_release()
-        raise
-    return task_id
+        _update_queue_positions_locked()
+    if job[3]:
+        whisper_release()
+    return True
 
 
 def start_audio_task(video_id, bitrate='320', transcribe=False, timestamps=False):
@@ -1799,7 +1902,6 @@ MCP_OAUTH_SCOPES = os.environ.get('MCP_OAUTH_SCOPES', '').split()
 PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', '').strip().rstrip('/')
 MCP_ALLOWED_ORIGINS = {o.strip().rstrip('/').lower()
                        for o in os.environ.get('MCP_ALLOWED_ORIGINS', '').split(',') if o.strip()}
-MCP_MAX_ACTIVE_JOBS = max(1, _env_int('MCP_MAX_ACTIVE_JOBS', 4))
 
 
 def _mcp_config_error():
@@ -1830,7 +1932,8 @@ MCP_INSTRUCTIONS = (
     'with Whisper, as plain text or as SRT subtitles with timestamps. Downloads and '
     'transcription run as background jobs: each tool waits up to wait_seconds, and if the '
     'job is still running it returns status "processing" with a task_id. Pass that task_id '
-    'to get_task_status to keep waiting. Transcription runs on CPU and can take several '
+    'to get_task_status to keep waiting. When the server is busy, new jobs wait in a queue '
+    'and start automatically; queue_position shows their place in line. Transcription runs on CPU and can take several '
     'minutes for a long video. Finished files are served at the returned url and are '
     'deleted automatically 1-2 hours after they are created.'
 )
@@ -2042,7 +2145,6 @@ MIME_TYPES = {
     '.srt': 'application/x-subrip',
     '.txt': 'text/plain',
 }
-_job_start_lock = threading.Lock()
 # Each waiting tools/call holds a thread; past this many, calls return without waiting.
 _wait_slots = threading.BoundedSemaphore(32)
 
@@ -2109,12 +2211,15 @@ def task_snapshot(task_id, base_url, transcript_chars=20000):
 
     status = entry.get('status')
     if status == 'processing':
-        return {
+        out = {
             'task_id': task_id,
             'status': 'processing',
             'progress': round(float(entry.get('progress') or 0), 1),
             'message': entry.get('message') or 'Processing...',
         }
+        if entry.get('queue_position'):
+            out['queue_position'] = entry['queue_position']
+        return out
     if status == 'error':
         return {'task_id': task_id, 'status': 'error', 'error': entry.get('error') or 'Unknown error'}
 
@@ -2163,7 +2268,7 @@ def _overall_progress(raw, message):
     95 and transcription 98), so the phase is taken from the status message instead.
     """
     message = (message or '').lower()
-    if message.startswith('transcribing'):
+    if 'transcri' in message:  # "Transcribing ..." or "Waiting for another transcription ..."
         return 95.0
     if 'convert' in message or 'merg' in message:
         return 92.0
@@ -2216,14 +2321,11 @@ def _wait_and_snapshot(task_id, wait_seconds, ctx, transcript_chars=20000):
 
 
 def _start_job(start):
-    """Start a background job unless the server is already at MCP_MAX_ACTIVE_JOBS."""
-    with _job_start_lock:
-        with downloads_lock:
-            active = sum(1 for d in active_downloads.values() if d.get('status') == 'processing')
-        if active >= MCP_MAX_ACTIVE_JOBS:
-            raise ToolError(f'Server busy: {active} jobs already running (limit {MCP_MAX_ACTIVE_JOBS}). '
-                            'Wait for one to finish with get_task_status, then retry.')
+    """Start a job, or queue it when MAX_ACTIVE_JOBS are already running."""
+    try:
         return start()
+    except QueueFull as e:
+        raise ToolError(str(e))
 
 
 # --- Tool arguments -----------------------------------------------------------------
@@ -2454,6 +2556,9 @@ def tool_list_downloads(args, ctx):
 
 def tool_delete_download(args, ctx):
     task_id = _arg_task_id(args)
+    if cancel_queued_task(task_id):
+        print(f'[MCP] delete_download {task_id}: cancelled while waiting in the queue')
+        return {'task_id': task_id, 'deleted': True}
     with downloads_lock:
         entry = active_downloads.get(task_id)
         if entry and entry.get('status') == 'processing':
@@ -2510,6 +2615,8 @@ _TASK_OUT = {
         'transcript_truncated': {'type': 'boolean'},
         'transcription_error': {'type': 'string', 'description': 'Set when the download succeeded but '
                                 'transcription failed.'},
+        'queue_position': {'type': 'integer', 'description': 'Place in line while the job waits for a '
+                           'free slot. It starts automatically.'},
         'next_step': {'type': 'string'},
     },
     'required': ['task_id', 'status'],
@@ -2691,7 +2798,8 @@ MCP_TOOL_DEFS = [
     {
         'name': 'delete_download',
         'title': 'Delete a download',
-        'description': 'Delete a finished job\'s files from the server. Running jobs cannot be deleted.',
+        'description': 'Delete a finished job\'s files from the server, or cancel a job that is still waiting '
+                       'in the queue. A job that is already running cannot be deleted.',
         'inputSchema': {'type': 'object', 'properties': {'task_id': _TASK_ID_ARG}, 'required': ['task_id']},
         'outputSchema': {
             'type': 'object',
@@ -3234,6 +3342,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 task_id = start_audio_task(video_id, bitrate, transcribe, timestamps)
                 self.send_json({'task_id': task_id, 'status': 'started'})
 
+            except QueueFull as e:
+                self.send_json({'error': str(e)}, 503)
             except json.JSONDecodeError:
                 self.send_json({'error': 'Invalid JSON'}, 400)
             except Exception as e:
@@ -3258,6 +3368,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 task_id = start_video_task(video_id, resolution, transcribe, timestamps)
                 self.send_json({'task_id': task_id, 'status': 'started'})
 
+            except QueueFull as e:
+                self.send_json({'error': str(e)}, 503)
             except json.JSONDecodeError:
                 self.send_json({'error': 'Invalid JSON'}, 400)
             except Exception as e:
@@ -3296,6 +3408,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             if task_dir is None:
                 self.send_json({'success': False, 'error': 'Invalid task id'}, 400)
                 return
+            cancel_queued_task(task_id)
 
             try:
                 if task_dir.exists():
@@ -3358,6 +3471,7 @@ def main():
     print(f"   Local:   http://localhost:{EXTERNAL_PORT}")
     print(f"   Network: http://{local_ip}:{EXTERNAL_PORT}")
     print(f"\nShare the Network URL with others on your network")
+    print(f"\nJobs: up to {MAX_ACTIVE_JOBS} at once; more wait in a queue (max {MAX_QUEUED_JOBS})")
     if WEB_AUTH_PASSWORD:
         print(f"\nWeb UI auth: on (HTTP Basic, user {WEB_AUTH_USER!r})")
         if len(WEB_AUTH_PASSWORD) < 12:

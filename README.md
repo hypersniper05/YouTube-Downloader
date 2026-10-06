@@ -11,6 +11,7 @@ A self-hosted server that downloads YouTube videos as MP3 or MP4 files. It can a
 - MP3 audio (64-320 kbps) or MP4 video (360p-4K)
 - Transcription to plain text or SRT subtitles with Whisper Large V3 Turbo
 - Live progress, and a download history that stays after a page refresh
+- A job queue: 4 jobs run at the same time, and more jobs wait their turn
 - An MCP server, so AI assistants can download and transcribe videos
 - An optional login for the web page and for MCP
 - Automatic deletion of files 1-2 hours after a job finishes
@@ -105,7 +106,8 @@ Set these values in the `environment:` section of `docker-compose.yml`.
 | `MCP_ENABLED` | `1` | Set to `0` to disable the MCP endpoint |
 | `MCP_AUTH` | `off` | `off`, `token`, or `oauth` |
 | `MCP_AUTH_TOKEN` | not set | The token for `MCP_AUTH=token` |
-| `MCP_MAX_ACTIVE_JOBS` | `4` | The maximum number of jobs that MCP clients can run at the same time |
+| `MAX_ACTIVE_JOBS` | `4` | The number of jobs that run at the same time. More jobs wait in a queue |
+| `MAX_QUEUED_JOBS` | `100` | The maximum number of jobs that can wait in the queue |
 | `MCP_ALLOWED_ORIGINS` | not set | More browser origins that can call `/mcp`, separated by commas |
 | `PUBLIC_BASE_URL` | not set | The public URL for download links, if the server is behind a proxy |
 | `YTDLP_AUTO_UPDATE` | `1` | Updates yt-dlp each time the container starts |
@@ -119,6 +121,8 @@ To change the port, edit `ports:` in `docker-compose.yml`.
 | Problem | Solution |
 |---------|----------|
 | `HTTP Error 403: Forbidden` | YouTube sometimes refuses a download link. The server tries again with a new link. If it still fails, run `docker compose restart` to update yt-dlp. |
+| The status says "Waiting in queue" | Other jobs are running. The job starts automatically when one finishes. |
+| The status says "Waiting for another transcription" | Transcriptions run one at a time. This one starts when the current one finishes. |
 | The download fails for one video | The video may be private, age-restricted, or blocked in your region. |
 | The browser asks for a password | `WEB_AUTH_PASSWORD` is set. Log in as `admin`, or as the user in `WEB_AUTH_USER`. |
 | An MCP client gets error 401 | `MCP_AUTH` is on. Add the token to the client. |
