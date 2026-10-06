@@ -35,7 +35,10 @@ try:
     print(f"[OK] FFmpeg found: {FFMPEG_PATH}")
 except ImportError:
     FFMPEG_PATH = None
-    print("[WARN] imageio-ffmpeg not installed. Run: pip install imageio-ffmpeg")
+    if shutil.which('ffmpeg'):
+        print(f"[OK] FFmpeg found: {shutil.which('ffmpeg')}")
+    else:
+        print("[WARN] FFmpeg not found. Install ffmpeg, or run: pip install imageio-ffmpeg")
 
 # Configuration
 HOST = '0.0.0.0'  # Listen on all network interfaces
@@ -3472,6 +3475,22 @@ def cleanup_old_downloads():
                 pass
 
 
+def _network_url():
+    """The address other devices should use, if this process can tell. None if it cannot."""
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    if os.path.exists('/.dockerenv'):
+        # In a container the only address visible here is Docker's internal one, which other
+        # devices cannot reach. Docker publishes the port on the host's addresses instead.
+        return None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(('192.0.2.1', 80))  # TEST-NET-1: selects the outgoing interface, sends nothing
+            return f'http://{s.getsockname()[0]}:{EXTERNAL_PORT}'
+    except OSError:
+        return None
+
+
 def main():
     # Start cleanup thread
     cleanup_thread = threading.Thread(target=cleanup_old_downloads, daemon=True)
@@ -3480,19 +3499,18 @@ def main():
     # Start server
     server = ThreadedHTTPServer((HOST, PORT), RequestHandler)
     
-    # Get local IP for display
-    import socket
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
-    
+    network_url = _network_url()
+    other_devices = network_url or f"http://<this server's IP>:{EXTERNAL_PORT}"
+
     print("=" * 50)
     print("ytdl-web - YouTube Downloader")
     print("=" * 50)
-    print(f"\nServer running!")
-    print(f"\nAccess the web interface at:")
-    print(f"   Local:   http://localhost:{EXTERNAL_PORT}")
-    print(f"   Network: http://{local_ip}:{EXTERNAL_PORT}")
-    print(f"\nShare the Network URL with others on your network")
+    print(f"\nServer running on port {EXTERNAL_PORT}, on all network interfaces (0.0.0.0).")
+    print("\nOpen it at (plain http, not https):")
+    print(f"   This machine:   http://localhost:{EXTERNAL_PORT}")
+    print(f"   Other devices:  {other_devices}")
+    if not network_url:
+        print("   (Set PUBLIC_BASE_URL to show the exact address here.)")
     print(f"\nJobs: up to {MAX_ACTIVE_JOBS} at once; more wait in a queue (max {MAX_QUEUED_JOBS})")
     if WEB_AUTH_PASSWORD:
         print(f"\nWeb UI auth: on (HTTP Basic, user {WEB_AUTH_USER!r})")
@@ -3502,7 +3520,7 @@ def main():
         print("\nWeb UI auth: off (set WEB_AUTH_PASSWORD to require a login)")
     if MCP_ENABLED:
         print(f"\nMCP server (Streamable HTTP, protocol {MCP_MODERN_VERSIONS[0]} + legacy {MCP_LEGACY_VERSIONS[-1]}..{MCP_LEGACY_VERSIONS[0]}):")
-        print(f"   Endpoint: http://localhost:{EXTERNAL_PORT}/mcp")
+        print(f"   Endpoint: {other_devices}/mcp")
         print(f"   Auth:     {MCP_AUTH}")
         if MCP_CONFIG_ERROR:
             print(f"   [ERROR] {MCP_CONFIG_ERROR} - /mcp refuses every request until this is fixed")

@@ -67,6 +67,9 @@ RUN pip install --no-cache-dir -U \
 # Copy application
 COPY server.py .
 
+# The container runs as root on purpose; pip's warning about that is noise in the logs.
+ENV PIP_ROOT_USER_ACTION=ignore
+
 # Refresh yt-dlp on container start so a `docker compose restart` recovers from a
 # YouTube change without a rebuild. Opt out with YTDLP_AUTO_UPDATE=0.
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
