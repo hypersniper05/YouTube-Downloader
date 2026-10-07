@@ -1884,7 +1884,7 @@ def start_video_task(video_id, resolution='1080', transcribe=False, timestamps=F
 #
 # Authorization is optional and off by default: MCP_AUTH=off | token | oauth.
 
-SERVER_VERSION = '1.1.0'
+SERVER_VERSION = '1.2.0'
 SERVER_INFO = {'name': 'ytdl-web', 'title': 'ytdl-web YouTube Downloader', 'version': SERVER_VERSION}
 
 MCP_MODERN_VERSIONS = ['2026-07-28']
@@ -1900,6 +1900,10 @@ MCP_PRM_PATHS = ('/.well-known/oauth-protected-resource', '/.well-known/oauth-pr
 MCP_MAX_BODY_BYTES = 1024 * 1024
 MCP_DEFAULT_WAIT = 45
 MCP_MAX_WAIT = 600
+# Transcript text returned inline with a job result; get_transcript returns more. A result
+# carries it twice (text content and structuredContent), so keep it well under the ~25k-token
+# tool-output limits some clients apply.
+MCP_INLINE_TRANSCRIPT_CHARS = 20000
 
 
 def _env_flag(name, default):
@@ -1953,14 +1957,26 @@ MCP_CAPABILITIES = {'tools': {'listChanged': False}}
 MCP_CACHE_HINTS = {'ttlMs': 3600000, 'cacheScope': 'public'}
 
 MCP_INSTRUCTIONS = (
-    'ytdl-web downloads YouTube videos as MP3 audio or MP4 video and can transcribe them '
-    'with Whisper, as plain text or as SRT subtitles with timestamps. Downloads and '
-    'transcription run as background jobs: each tool waits up to wait_seconds, and if the '
-    'job is still running it returns status "processing" with a task_id. Pass that task_id '
-    'to get_task_status to keep waiting. When the server is busy, new jobs wait in a queue '
-    'and start automatically; queue_position shows their place in line. Transcription runs on CPU and can take several '
-    'minutes for a long video. Finished files are served at the returned url and are '
-    'deleted automatically 1-2 hours after they are created.'
+    'ytdl-web downloads YouTube videos as MP3 (download_audio) or MP4 (download_video) and '
+    'transcribes them with Whisper (transcribe_video, or transcribe=true on a download) as SRT '
+    'subtitles with timestamps or plain text. get_video_info looks up a video without starting '
+    'a job.\n'
+    'Jobs: download_audio, download_video and transcribe_video each start a job and return its '
+    'task_id and a status: "processing", "completed" or "error". Each call first waits up to '
+    f'wait_seconds (default {MCP_DEFAULT_WAIT}). If status is "processing", call get_task_status '
+    'with the task_id and repeat until "completed" or "error"; do not start the same job again. '
+    'A busy server queues jobs; they start automatically (queue_position = place in line). '
+    'progress is percent 0-100. Read next_step when present. '
+    'On "error", give the user the error text (403s and yt-dlp crashes were already retried).\n'
+    'Results: file and transcript_file each have name, url (direct download link) and '
+    'mime_type. The files stay on the server: give the user the url. transcript holds the text, '
+    f'up to {MCP_INLINE_TRANSCRIPT_CHARS:,} characters (transcript_truncated=true if cut); '
+    'get_transcript returns more (max_chars). transcription_error means the download succeeded '
+    'but transcription failed.\n'
+    'Lifetime: files are deleted 1-2 hours after the job finishes. list_downloads lists started '
+    "and finished jobs. delete_download deletes a finished job's files or cancels a queued job; "
+    'a running job cannot be deleted or stopped.\n'
+    'Transcribing a long video can take several minutes.'
 )
 
 
@@ -2226,20 +2242,35 @@ def _read_transcript(path, max_chars):
     return text, False, len(text)
 
 
-def task_snapshot(task_id, base_url, transcript_chars=20000):
+def _reported_progress_locked(entry):
+    """A running task's progress on one 0-100 scale that never goes back between polls.
+
+    The raw value restarts for each stream and phase (see _overall_progress), so a poll could
+    otherwise see 100 while the job still runs, or 90 followed by 10. Hold downloads_lock.
+    """
+    value = max(_overall_progress(entry.get('progress'), entry.get('message')),
+                entry.get('reported_progress', 0.0))
+    entry['reported_progress'] = value
+    return round(value, 1)
+
+
+def task_snapshot(task_id, base_url, transcript_chars=MCP_INLINE_TRANSCRIPT_CHARS):
     """Describe a task for an MCP client. Raises ToolError for an unknown or expired id."""
     task_dir = resolve_task_dir(task_id)
     if task_dir is None:
         raise ToolError(f'Invalid task_id {task_id!r}: expected the 8-character id returned when the job started.')
     with downloads_lock:
-        entry = dict(active_downloads.get(task_id) or {})
+        live = active_downloads.get(task_id)
+        entry = dict(live or {})
+        if entry.get('status') == 'processing':
+            entry['progress'] = _reported_progress_locked(live)
 
     status = entry.get('status')
     if status == 'processing':
         out = {
             'task_id': task_id,
             'status': 'processing',
-            'progress': round(float(entry.get('progress') or 0), 1),
+            'progress': entry['progress'],
             'message': entry.get('message') or 'Processing...',
         }
         if entry.get('queue_position'):
@@ -2252,7 +2283,7 @@ def task_snapshot(task_id, base_url, transcript_chars=20000):
     # case the files on disk are the record.
     if not task_dir.is_dir():
         raise ToolError(f'Unknown or expired task_id {task_id}. Files are deleted 1-2 hours after '
-                        'they are created; start a new download.')
+                        'the job finishes; start a new download.')
     media = transcript = None
     for path in _finished_files(task_dir):
         ext = path.suffix.lower()
@@ -2315,24 +2346,24 @@ def _wait_for_task(task_id, wait_seconds, progress, alive):
     last_sent = 0.0
     while True:
         with downloads_lock:
-            entry = active_downloads.get(task_id) or {}
-            status, raw, message = entry.get('status'), entry.get('progress'), entry.get('message')
-        if status != 'processing':
-            return
+            entry = active_downloads.get(task_id)
+            if not entry or entry.get('status') != 'processing':
+                return
+            value, message = _reported_progress_locked(entry), entry.get('message')
         if alive is not None and not alive():
             raise ClientGone()
         now = time.monotonic()
         if progress is not None:
-            key = (raw, message)
+            key = (value, message)
             if (key != last_key and now - last_sent >= 1.0) or now - last_sent >= 15.0:
-                progress(_overall_progress(raw, message), message or 'Processing...')
+                progress(value, message or 'Processing...')
                 last_key, last_sent = key, now
         if now >= deadline:
             return
         time.sleep(min(0.5, deadline - now))
 
 
-def _wait_and_snapshot(task_id, wait_seconds, ctx, transcript_chars=20000):
+def _wait_and_snapshot(task_id, wait_seconds, ctx, transcript_chars=MCP_INLINE_TRANSCRIPT_CHARS):
     if wait_seconds and _wait_slots.acquire(blocking=False):
         try:
             _wait_for_task(task_id, wait_seconds, ctx['progress'], ctx['alive'])
@@ -2498,17 +2529,19 @@ def tool_download_video(args, ctx):
 
 def tool_transcribe_video(args, ctx):
     video_id = _arg_video_id(args)
-    srt = _arg_enum(args, 'format', ('srt', 'text'), 'srt') == 'srt'
+    # Before 1.2.0 this argument was called "format"; older clients still send that name.
+    key = 'format' if args.get('transcript_format') is None and args.get('format') is not None else 'transcript_format'
+    srt = _arg_enum(args, key, ('srt', 'text'), 'srt') == 'srt'
     wait = _arg_int(args, 'wait_seconds', MCP_DEFAULT_WAIT, 0, MCP_MAX_WAIT)
     # Whisper resamples to 16 kHz mono, so the lowest bitrate loses nothing.
     task_id = _start_job(lambda: start_audio_task(video_id, '64', True, srt))
     print(f'[MCP] transcribe_video {video_id} format={"srt" if srt else "text"} -> task {task_id}')
-    return _wait_and_snapshot(task_id, wait, ctx, transcript_chars=50000)
+    return _wait_and_snapshot(task_id, wait, ctx)
 
 
 def tool_get_task_status(args, ctx):
     task_id = _arg_task_id(args)
-    wait = _arg_int(args, 'wait_seconds', 30, 0, MCP_MAX_WAIT)
+    wait = _arg_int(args, 'wait_seconds', MCP_DEFAULT_WAIT, 0, MCP_MAX_WAIT)
     task_snapshot(task_id, ctx['base_url'], 0)  # unknown or expired id: fail before waiting
     return _wait_and_snapshot(task_id, wait, ctx)
 
@@ -2556,11 +2589,14 @@ def tool_list_downloads(args, ctx):
     for mtime, task_dir in dirs[:200]:
         task_id = task_dir.name
         with downloads_lock:
-            entry = dict(active_downloads.get(task_id) or {})
+            live = active_downloads.get(task_id)
+            entry = dict(live or {})
+            if entry.get('status') == 'processing':
+                entry['progress'] = _reported_progress_locked(live)
         modified = datetime.fromtimestamp(mtime, timezone.utc)
         row = {'task_id': task_id, 'modified': modified.isoformat(timespec='seconds'), 'files': []}
         if entry.get('status') == 'processing':
-            row.update(status='processing', progress=round(float(entry.get('progress') or 0), 1),
+            row.update(status='processing', progress=entry['progress'],
                        message=entry.get('message') or 'Processing...')
         elif entry.get('status') == 'error':
             row.update(status='error', error=entry.get('error') or 'Unknown error')
@@ -2607,11 +2643,14 @@ _WAIT_ARG = {'type': 'integer', 'minimum': 0, 'maximum': MCP_MAX_WAIT, 'default'
 _TASK_ID_ARG = {'type': 'string', 'pattern': '^[0-9a-f]{8}$',
                 'description': 'The 8-character task_id returned by download_audio, download_video or transcribe_video.'}
 _TRANSCRIBE_ARG = {'type': 'boolean', 'default': False,
-                   'description': 'Also transcribe the audio with Whisper. Runs on CPU: allow several minutes '
+                   'description': 'Also transcribe the audio with Whisper. Allow several minutes '
                    'for a long video.'}
 _TRANSCRIPT_FORMAT_ARG = {'type': 'string', 'enum': ['srt', 'text'], 'default': 'srt',
-                          'description': '"srt" for subtitles with timestamps, "text" for plain text. '
-                          'Only used when transcribe is true.'}
+                          'description': '"srt" for subtitles with timestamps, "text" for plain text.'}
+_DOWNLOAD_TRANSCRIPT_FORMAT_ARG = dict(_TRANSCRIPT_FORMAT_ARG, description=_TRANSCRIPT_FORMAT_ARG['description']
+                                       + ' Only used when transcribe is true.')
+_JOB_STEPS = (f'Starts a job: waits up to wait_seconds (default {MCP_DEFAULT_WAIT}), then returns task_id and '
+              'status. If status is "processing", call get_task_status with the task_id.')
 
 _FILE_OUT = {
     'type': 'object',
@@ -2635,8 +2674,9 @@ _TASK_OUT = {
         'file': _FILE_OUT,
         'transcript_file': _FILE_OUT,
         'transcript_format': {'type': 'string', 'enum': ['srt', 'text']},
-        'transcript': {'type': 'string', 'description': 'Transcript text, possibly truncated - see '
-                       'transcript_truncated. get_transcript returns the full text.'},
+        'transcript': {'type': 'string', 'description': f'Transcript text, up to '
+                       f'{MCP_INLINE_TRANSCRIPT_CHARS:,} characters - see transcript_truncated. '
+                       'get_transcript returns more.'},
         'transcript_truncated': {'type': 'boolean'},
         'transcription_error': {'type': 'string', 'description': 'Set when the download succeeded but '
                                 'transcription failed.'},
@@ -2681,9 +2721,11 @@ MCP_TOOL_DEFS = [
     {
         'name': 'download_audio',
         'title': 'Download YouTube audio as MP3',
-        'description': 'Download a YouTube video as an MP3 and optionally transcribe it (plain text or SRT '
-                       'subtitles). Returns direct download links. Long jobs return a task_id to poll with '
-                       'get_task_status. Files are deleted 1-2 hours after they are created.',
+        'description': "Download a YouTube video's audio as an MP3 (bitrate in kbps, default 320). Set "
+                       'transcribe=true to also get a Whisper transcript (transcript_format "srt", the default, '
+                       'or "text"); if you only need the words, use transcribe_video. ' + _JOB_STEPS +
+                       ' When completed, file.url is the MP3 link, plus transcript_file and transcript if '
+                       'transcribed. Files are deleted 1-2 hours after the job finishes.',
         'inputSchema': {
             'type': 'object',
             'properties': {
@@ -2691,7 +2733,7 @@ MCP_TOOL_DEFS = [
                 'bitrate': {'type': 'integer', 'enum': AUDIO_BITRATES, 'default': 320,
                             'description': 'MP3 bitrate in kbps.'},
                 'transcribe': _TRANSCRIBE_ARG,
-                'transcript_format': _TRANSCRIPT_FORMAT_ARG,
+                'transcript_format': _DOWNLOAD_TRANSCRIPT_FORMAT_ARG,
                 'wait_seconds': _WAIT_ARG,
             },
             'required': ['url'],
@@ -2702,10 +2744,12 @@ MCP_TOOL_DEFS = [
     {
         'name': 'download_video',
         'title': 'Download YouTube video as MP4',
-        'description': 'Download a YouTube video as an MP4 at up to the requested resolution (lower if the '
-                       'video has no such stream) and optionally transcribe it (plain text or SRT subtitles). '
-                       'Returns direct download links. Long jobs return a task_id to poll with '
-                       'get_task_status. Files are deleted 1-2 hours after they are created.',
+        'description': 'Download a YouTube video as an MP4 at up to resolution (maximum height in pixels, '
+                       'default 1080); if the video has no stream that high, a lower one is used '
+                       '(get_video_info lists available_resolutions). Set transcribe=true to also get a '
+                       'Whisper transcript (transcript_format "srt", the default, or "text"). ' + _JOB_STEPS +
+                       ' When completed, file.url is the MP4 link, plus transcript_file and transcript if '
+                       'transcribed. Files are deleted 1-2 hours after the job finishes.',
         'inputSchema': {
             'type': 'object',
             'properties': {
@@ -2713,7 +2757,7 @@ MCP_TOOL_DEFS = [
                 'resolution': {'type': 'integer', 'enum': VIDEO_RESOLUTIONS, 'default': 1080,
                                'description': 'Maximum video height in pixels.'},
                 'transcribe': _TRANSCRIBE_ARG,
-                'transcript_format': _TRANSCRIPT_FORMAT_ARG,
+                'transcript_format': _DOWNLOAD_TRANSCRIPT_FORMAT_ARG,
                 'wait_seconds': _WAIT_ARG,
             },
             'required': ['url'],
@@ -2724,16 +2768,19 @@ MCP_TOOL_DEFS = [
     {
         'name': 'transcribe_video',
         'title': 'Transcribe a YouTube video',
-        'description': 'Transcribe a YouTube video with Whisper and return the transcript, as SRT subtitles '
-                       'with timestamps (default) or plain text, plus a link to the .srt/.txt file. Use this '
-                       'when you want the words rather than the media. Runs on CPU: a long video can take '
-                       'several minutes, in which case this returns a task_id to poll with get_task_status.',
+        'description': 'Transcribe a YouTube video with Whisper. Use it when you need the words, not the '
+                       'media file. transcript_format: "srt" (subtitles with timestamps, default) or "text" '
+                       '(plain text). ' + _JOB_STEPS + ' A long video can take several minutes; progress '
+                       'stays at 95 while Whisper runs (read message). When completed, transcript holds the '
+                       f'text (up to {MCP_INLINE_TRANSCRIPT_CHARS:,} characters, see transcript_truncated; '
+                       'get_transcript returns more) and transcript_file links to the .srt/.txt file. file is the '
+                       'low-bitrate MP3 that was transcribed. If transcription_error is set, transcription '
+                       'failed.',
         'inputSchema': {
             'type': 'object',
             'properties': {
                 'url': _URL_ARG,
-                'format': {'type': 'string', 'enum': ['srt', 'text'], 'default': 'srt',
-                           'description': '"srt" for subtitles with timestamps, "text" for plain text.'},
+                'transcript_format': _TRANSCRIPT_FORMAT_ARG,
                 'wait_seconds': _WAIT_ARG,
             },
             'required': ['url'],
@@ -2744,15 +2791,19 @@ MCP_TOOL_DEFS = [
     {
         'name': 'get_task_status',
         'title': 'Get job status',
-        'description': 'Check on, or wait for, a job started by download_audio, download_video or '
-                       'transcribe_video. Returns its progress while running, and the download links (and '
-                       'transcript, if one was requested) once it completes.',
+        'description': 'Wait for, or check, a job started by download_audio, download_video or '
+                       f'transcribe_video. Waits up to wait_seconds (default {MCP_DEFAULT_WAIT}, max '
+                       f'{MCP_MAX_WAIT}; 0 = return at once) and returns the same fields as the tool that '
+                       'started the job: status "processing" (with progress 0-100, and queue_position while '
+                       'queued), "completed" (file / transcript_file links, and transcript if one was '
+                       'requested), or "error" (see error). Call it again while status is "processing"; it '
+                       'only reads the job and never restarts it.',
         'inputSchema': {
             'type': 'object',
             'properties': {
                 'task_id': _TASK_ID_ARG,
-                'wait_seconds': dict(_WAIT_ARG, default=30, description='Seconds to wait for the job to '
-                                     'finish before returning its current status. 0 returns immediately.'),
+                'wait_seconds': dict(_WAIT_ARG, description='Seconds to wait for the job to finish before '
+                                     'returning its current status. 0 returns immediately.'),
             },
             'required': ['task_id'],
         },
@@ -2762,9 +2813,11 @@ MCP_TOOL_DEFS = [
     {
         'name': 'get_transcript',
         'title': 'Get transcript text',
-        'description': 'Return the full transcript (SRT or plain text) of a finished job that was '
-                       'transcribed. Use it when a result said transcript_truncated, or to re-read a '
-                       'transcript later.',
+        'description': 'Return the transcript text (SRT or plain text) of a completed job that was '
+                       'transcribed (transcribe_video, or a download with transcribe=true). Use it when a '
+                       'result had transcript_truncated=true, or to re-read a transcript later. max_chars '
+                       '(default 100000) caps the text returned; truncated and total_chars show whether more '
+                       'exists. Also returns file, a direct download link to the transcript file.',
         'inputSchema': {
             'type': 'object',
             'properties': {
@@ -2792,7 +2845,7 @@ MCP_TOOL_DEFS = [
         'name': 'list_downloads',
         'title': 'List downloads',
         'description': 'List the jobs whose files are still on the server, newest first, with their status '
-                       'and download links. Files are deleted 1-2 hours after they are created.',
+                       'and download links. Files are deleted 1-2 hours after the job finishes.',
         'inputSchema': {'type': 'object', 'properties': {}, 'additionalProperties': False},
         'outputSchema': {
             'type': 'object',

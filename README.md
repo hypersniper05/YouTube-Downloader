@@ -58,7 +58,7 @@ Other MCP clients can connect to `http://YOUR_IP:6080/mcp` with the Streamable H
 | `download_video` | Downloads an MP4, with an optional transcript |
 | `transcribe_video` | Returns the transcript as SRT subtitles or plain text |
 | `get_task_status` | Waits for a long job to finish |
-| `get_transcript` | Returns the full transcript of a finished job |
+| `get_transcript` | Returns the transcript text of a finished job |
 | `list_downloads` | Lists the files on the server |
 | `delete_download` | Deletes the files of a job |
 
