@@ -197,6 +197,11 @@ HTML_PAGE = '''<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>YouTube Downloader</title>
+    <meta name="description" content="Download YouTube videos as MP3 or MP4, and transcribe them.">
+    <meta name="theme-color" content="#0f0f0f">
+    <link rel="icon" href="/favicon.ico" sizes="48x48">
+    <link rel="icon" href="/static/icon-192.png" type="image/png" sizes="192x192">
+    <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -3174,6 +3179,16 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+# Site icons. Public even with WEB_AUTH_PASSWORD set: none of them hold anything private.
+STATIC_DIR = Path(__file__).parent / 'static'
+APP_ASSETS = {
+    'icon-192.png': 'image/png',
+    'apple-touch-icon.png': 'image/png',
+    'favicon.ico': 'image/x-icon',
+}
+APP_ASSET_ALIASES = {'/favicon.ico': 'favicon.ico', '/apple-touch-icon.png': 'apple-touch-icon.png'}
+
+
 def web_auth_ok(headers):
     """True when web UI auth is off, or the request carries the configured Basic credentials."""
     if not WEB_AUTH_PASSWORD:
@@ -3205,6 +3220,25 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
     
+    def serve_app_asset(self, path):
+        """Serve a site icon. Returns False if path is not one of them."""
+        name = APP_ASSET_ALIASES.get(path) or (path[len('/static/'):] if path.startswith('/static/') else None)
+        if name not in APP_ASSETS:  # a fixed list, so no path ever reaches the filesystem
+            return False
+        try:
+            body = (STATIC_DIR / name).read_bytes()
+        except OSError:
+            self.send_error(404, 'Not found')
+            return True
+        content_type = APP_ASSETS[name]
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'public, max-age=86400')
+        self.end_headers()
+        self.wfile.write(body)
+        return True
+
     def require_web_auth(self, path):
         """Gate the web UI and /api behind WEB_AUTH_PASSWORD. Sends the 401 and returns False on failure."""
         if path.startswith('/download/') or web_auth_ok(self.headers):
@@ -3237,6 +3271,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         
+        if self.serve_app_asset(path):
+            return
+
         if not self.require_web_auth(path):
             return
 

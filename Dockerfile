@@ -66,6 +66,8 @@ RUN pip install --no-cache-dir -U \
 
 # Copy application
 COPY server.py .
+# Site icons (regenerate with tools/make_icons.py)
+COPY static/ ./static/
 
 # The container runs as root on purpose; pip's warning about that is noise in the logs.
 ENV PIP_ROOT_USER_ACTION=ignore
