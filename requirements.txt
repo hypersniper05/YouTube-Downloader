@@ -13,6 +13,9 @@ torch
 transformers>=4.40.0
 accelerate
 
+# UVR vocal separation (MDX-Net models). With an NVIDIA GPU, install onnxruntime-gpu instead.
+onnxruntime
+
 # Note: You also need ffmpeg installed on your system
 # Ubuntu/Debian: sudo apt install ffmpeg
 # macOS: brew install ffmpeg

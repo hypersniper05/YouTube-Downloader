@@ -1,6 +1,6 @@
 # YouTube Downloader
 
-A self-hosted server that downloads YouTube videos as MP3 or MP4 files. It can also transcribe the audio to text or SRT subtitles with Whisper. Use it from the web page, or let an AI assistant such as Claude use it through MCP.
+A self-hosted server that downloads YouTube videos as MP3 or MP4 files. It can transcribe the audio to text or SRT subtitles with Whisper, and it can split the vocals from the background with UVR. Use it from the web page, or let an AI assistant such as Claude use it through MCP.
 
 | Audio | Video | History |
 |-------|-------|---------|
@@ -10,6 +10,8 @@ A self-hosted server that downloads YouTube videos as MP3 or MP4 files. It can a
 
 - MP3 audio (64-320 kbps) or MP4 video (360p-4K)
 - Transcription to plain text or SRT subtitles with Whisper Large V3 Turbo
+- Vocal separation with UVR MDX-Net: keep only the vocals, only the background, or both
+- A Settings page to pick the Whisper and UVR models, and the GPU or CPU for each
 - Live progress, and a download history that stays after a page refresh
 - A job queue: 4 jobs run at the same time, and more jobs wait their turn
 - An MCP server, so AI assistants can download and transcribe videos
@@ -18,7 +20,7 @@ A self-hosted server that downloads YouTube videos as MP3 or MP4 files. It can a
 
 ## Quick start
 
-You need Docker. An NVIDIA GPU makes transcription faster, but it is not necessary.
+You need Docker. An NVIDIA GPU makes transcription and vocal separation much faster, but it is not necessary.
 
 ```bash
 git clone https://github.com/hypersniper05/YouTube-Downloader.git
@@ -28,7 +30,11 @@ docker compose up -d
 
 Open `http://localhost:6080`. Other devices on your network can use `http://YOUR_IP:6080`.
 
-If you have no NVIDIA GPU, remove the `deploy:` block from `docker-compose.yml` first. Transcription then runs on the CPU.
+The default setup uses all NVIDIA GPUs. If you have no NVIDIA GPU, or the container does not start because of a GPU error, use the CPU setup instead:
+
+```bash
+docker compose -f docker-compose.cpu.yml up -d
+```
 
 ## Use the web page
 
@@ -36,10 +42,35 @@ If you have no NVIDIA GPU, remove the `deploy:` block from `docker-compose.yml` 
 2. Paste a YouTube link and click **Get Info**.
 3. Select the quality.
 4. To get a transcript, select **Extract transcription**. To get an SRT file, also select **Include timestamps**.
-5. Click **Download**.
-6. When the job is done, click the buttons to save the media file and the transcript.
+5. To split the vocals from the background, select **Separate vocals and background**. Then select **Vocals only**, **Background only**, or **Both**.
+6. Click **Download**.
+7. When the job is done, click the buttons to save each file.
 
-The **History** tab shows your past downloads. From there, you can download the files again or delete them.
+The **History** tab shows your past downloads. From there, you can download each file again or delete them.
+
+## Separate vocals and background
+
+The server uses the UVR MDX-Net models from [Ultimate Vocal Remover](https://github.com/Anjok07/ultimatevocalremovergui). You always get the original file too.
+
+| Option | You get |
+|--------|---------|
+| **Vocals only** | The voice without the music or background sound |
+| **Background only** | The music and background sound without the voice, like karaoke |
+| **Both** | One file of each |
+
+For a video, each new file is an MP4 with the same picture. For audio, each new file is an MP3.
+
+On a CPU with 2 cores, the separation takes about as long as the song itself. A GPU is much faster. The first job downloads the model, which is about 67 MB.
+
+## Settings page
+
+The **Settings** tab lets you choose:
+
+- The Whisper model. Larger models are more accurate but slower.
+- The UVR model. **Inst HQ 3** (the default) and **Inst HQ 4** are best at the background. **Kim Vocal 2** and **Voc FT** are best at the vocals. Each model makes both files.
+- Where each model runs: **Automatic** (the GPU if there is one), **CPU**, or a specific GPU. The page lists every NVIDIA GPU it finds.
+
+The settings are saved on the server and stay after a restart or an update.
 
 ## Use with an AI assistant (MCP)
 
@@ -54,13 +85,15 @@ Other MCP clients can connect to `http://YOUR_IP:6080/mcp` with the Streamable H
 | Tool | What it does |
 |------|--------------|
 | `get_video_info` | Gets the title, the length, and the available qualities |
-| `download_audio` | Downloads an MP3, with an optional transcript |
-| `download_video` | Downloads an MP4, with an optional transcript |
+| `download_audio` | Downloads an MP3, with an optional transcript and vocal separation |
+| `download_video` | Downloads an MP4, with an optional transcript and vocal separation |
 | `transcribe_video` | Returns the transcript as SRT subtitles or plain text |
 | `get_task_status` | Waits for a long job to finish |
 | `get_transcript` | Returns the transcript text of a finished job |
 | `list_downloads` | Lists the files on the server |
 | `delete_download` | Deletes the files of a job |
+
+To separate the audio, add `"remove_vocals": true`, `"remove_background": true`, or both to `download_audio` or `download_video`. The result then has a link for each file: `file` (the original), `vocals_file`, `background_file`, and `transcript_file` if you asked for a transcript.
 
 A long job, such as the transcription of a long video, can take several minutes. If the job is not done in time, the tool returns a `task_id`. The assistant then uses `get_task_status` to wait for the result.
 
@@ -97,7 +130,7 @@ Set `MCP_AUTH=oauth` to accept tokens from your own OAuth server, such as Keyclo
 
 ## Settings
 
-Set these values in the `environment:` section of `docker-compose.yml`.
+Set these values in the `environment:` section of `docker-compose.yml`. The Whisper and UVR values are only the defaults: a choice that you save on the Settings page replaces them.
 
 | Setting | Default | What it does |
 |---------|---------|--------------|
@@ -113,8 +146,10 @@ Set these values in the `environment:` section of `docker-compose.yml`.
 | `YTDLP_AUTO_UPDATE` | `1` | Updates yt-dlp each time the container starts |
 | `YTDLP_RETRIES` | `3` | The number of retries when YouTube refuses a download or yt-dlp crashes |
 | `WHISPER_MODEL_ID` | `openai/whisper-large-v3-turbo` | The Whisper model. Smaller models, such as `openai/whisper-small`, are faster |
-| `WHISPER_DEVICE` | `auto` | `auto` uses the GPU if there is one. Set `cpu` to always use the CPU |
+| `WHISPER_DEVICE` | `auto` | `auto` uses the first GPU if there is one. Also `cpu`, or a GPU such as `cuda:1` |
 | `WHISPER_FALLBACK_MODEL_ID` | `openai/whisper-small` | The model used on the CPU when the GPU fails. It is about 2 times faster on a CPU than the default model |
+| `UVR_MODEL` | `inst_hq_3` | The UVR model for vocal separation: `inst_hq_3`, `inst_hq_4`, `kim_vocal_2`, or `voc_ft` |
+| `UVR_DEVICE` | `auto` | Like `WHISPER_DEVICE`, for vocal separation |
 
 To change the port, edit `ports:` in `docker-compose.yml`.
 
@@ -124,12 +159,14 @@ To change the port, edit `ports:` in `docker-compose.yml`.
 |---------|----------|
 | `HTTP Error 403: Forbidden` | YouTube sometimes refuses a download link. The server tries again with a new link. If it still fails, run `docker compose restart` to update yt-dlp. |
 | The status says "Waiting in queue" | Other jobs are running. The job starts automatically when one finishes. |
-| The status says "Waiting for another transcription" | Transcriptions run one at a time. This one starts when the current one finishes. |
+| The status says "Waiting for another AI job" | Transcription and vocal separation run one at a time. This one starts when the current one finishes. |
+| The container does not start, with `nvidia-container-runtime-hook` or `SIGSEGV` in the error | Docker cannot use the GPU. Restart the computer. Until then, use `docker compose -f docker-compose.cpu.yml up -d`. |
 | The download fails for one video | The video may be private, age-restricted, or blocked in your region. |
 | The browser asks for a password | `WEB_AUTH_PASSWORD` is set. Log in as `admin`, or as the user in `WEB_AUTH_USER`. |
 | An MCP client gets error 401 | `MCP_AUTH` is on. Add the token to the client. |
 | Transcription is slow | Without a GPU, Whisper runs on the CPU. Use a smaller `WHISPER_MODEL_ID`. |
-| "Transcription failed: Whisper returned an empty transcript", or the server restarts during a transcription | Some GPUs cannot run Whisper. The server then switches to the CPU by itself, with the faster `WHISPER_FALLBACK_MODEL_ID`. To skip the GPU, set `WHISPER_DEVICE=cpu`. |
+| "Transcription failed: Whisper returned an empty transcript", or the server restarts during a transcription | Some GPUs cannot run Whisper. The server then switches to the CPU by itself, with the faster `WHISPER_FALLBACK_MODEL_ID`. To skip the GPU, select **CPU** on the Settings page. |
+| Vocal separation is slow | Without a GPU, UVR runs on the CPU and takes about as long as the audio. |
 | The first transcription is slow | The first run downloads the Whisper model, which is about 1.6 GB. |
 | Other devices cannot connect | Make sure that your firewall allows port 6080. |
 
@@ -147,9 +184,10 @@ The container updates yt-dlp each time it starts. If downloads stop working, run
 | Endpoint | Method | What it does |
 |----------|--------|--------------|
 | `/api/info` | POST | Gets video information. Body: `{"url": "..."}` |
-| `/api/convert` | POST | Starts an MP3 job. Body: `url`, `bitrate`, `transcribe`, `timestamps` |
-| `/api/convert-video` | POST | Starts an MP4 job. Body: `url`, `resolution`, `transcribe`, `timestamps` |
+| `/api/convert` | POST | Starts an MP3 job. Body: `url`, `bitrate`, `transcribe`, `timestamps`, `remove_vocals`, `remove_background` |
+| `/api/convert-video` | POST | Starts an MP4 job. Body: `url`, `resolution`, `transcribe`, `timestamps`, `remove_vocals`, `remove_background` |
 | `/api/check/:id` | GET | Gets the status of a job |
+| `/api/settings` | GET, POST | Gets or saves the Settings page values: `whisper_model`, `whisper_device`, `uvr_model`, `uvr_device` |
 | `/api/delete/:id` | DELETE | Deletes the files of a job |
 | `/download/:id/:file` | GET | Downloads a finished file |
 | `/mcp` | POST | The MCP endpoint |
@@ -161,11 +199,15 @@ If `WEB_AUTH_PASSWORD` is set, send the login with each `/api` call, for example
 Install Python 3.11 and FFmpeg. Then run:
 
 ```bash
-pip install "yt-dlp[default,deno]" torch "transformers>=4.40.0" accelerate
+pip install "yt-dlp[default,deno]" torch "transformers>=4.40.0" accelerate onnxruntime
 python server.py
 ```
 
-For GPU transcription, install `torch` from `https://download.pytorch.org/whl/cu128`.
+For the GPU, install `torch` from `https://download.pytorch.org/whl/cu128`, and install `onnxruntime-gpu` instead of `onnxruntime`.
+
+## Credits
+
+Vocal separation uses the MDX-Net models of [Ultimate Vocal Remover](https://github.com/Anjok07/ultimatevocalremovergui) (MIT License).
 
 ## Disclaimer
 

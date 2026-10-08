@@ -45,6 +45,11 @@ RUN pip install --no-cache-dir \
     "transformers>=4.40.0" \
     accelerate
 
+# UVR vocal separation runs MDX-Net models on onnxruntime. The GPU build also has the CPU
+# provider, so one package serves both. 1.26.0 is the last release built for CUDA 12 (1.27+
+# need CUDA 13); it uses the image's CUDA 12.8 libraries and the cuDNN 9 that torch brings.
+RUN pip install --no-cache-dir "onnxruntime-gpu==1.26.0"
+
 # yt-dlp goes stale quickly as YouTube changes; keep it in its own layer.
 #
 # YouTube serves an obfuscated JavaScript player challenge that must be executed to

@@ -30,13 +30,14 @@ services:
       # Optional login for the web UI and /api/* (HTTP Basic). No auth when unset.
       # - WEB_AUTH_PASSWORD=
       # - WEB_AUTH_USER=admin
-    # Enable NVIDIA GPU access
+    # Use every NVIDIA GPU. The Settings page picks which one Whisper and UVR run on.
+    # No NVIDIA GPU? Start it with docker-compose.cpu.yml instead (see README).
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
 
 volumes:

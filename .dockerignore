@@ -24,6 +24,6 @@ venv/
 Thumbs.db
 
 # Docker
-docker-compose.yml
+docker-compose*.yml
 Dockerfile
 .dockerignore
