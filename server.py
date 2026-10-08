@@ -59,6 +59,9 @@ downloads_lock = threading.Lock()
 
 # Whisper transcription state
 WHISPER_MODEL_ID = os.environ.get('WHISPER_MODEL_ID', 'openai/whisper-large-v3-turbo')
+# Used on the CPU after the GPU failed: a server sized for GPU transcription would otherwise
+# take minutes per video. A CPU-only install keeps WHISPER_MODEL_ID.
+WHISPER_FALLBACK_MODEL_ID = os.environ.get('WHISPER_FALLBACK_MODEL_ID', 'openai/whisper-small')
 WHISPER_MODEL_DIR = os.environ.get('WHISPER_MODEL_DIR', str(Path(__file__).parent / 'whisper-model'))
 # auto: the GPU when PyTorch sees one, else the CPU. cpu / cuda: always that device.
 WHISPER_DEVICE = os.environ.get('WHISPER_DEVICE', 'auto').strip().lower()
@@ -101,8 +104,11 @@ def _set_gpu_marker(note):
         pass
 
 
-def _load_whisper(device=None):
-    """Load the Whisper model on demand. Returns the ASR pipeline."""
+def _load_whisper(device=None, fallback=False):
+    """Load the Whisper model on demand. Returns the ASR pipeline.
+
+    fallback=True (or a GPU that failed before) loads WHISPER_FALLBACK_MODEL_ID on the CPU.
+    """
     global _whisper_pipe, _whisper_on_gpu, _whisper_desc
     if _whisper_pipe is not None:
         return _whisper_pipe
@@ -113,22 +119,24 @@ def _load_whisper(device=None):
 
     if device is None:
         device = _whisper_device(torch.cuda.is_available())
+        fallback = device == "cpu" and _whisper_gpu_failed
+    model_id = WHISPER_FALLBACK_MODEL_ID if fallback else WHISPER_MODEL_ID
     dtype = torch.float16 if device == "cuda" else torch.float32
     if device == "cuda":
         hardware = torch.cuda.get_device_name(0)
     else:
         hardware = f"{torch.get_num_threads()} threads, {torch.backends.cpu.get_cpu_capability()}"
-    _whisper_desc = (f"{device} ({hardware}), {str(dtype).replace('torch.', '')}; "
+    _whisper_desc = (f"{model_id} on {device} ({hardware}), {str(dtype).replace('torch.', '')}; "
                      f"torch {torch.__version__}, transformers {transformers.__version__}")
-    print(f"[Whisper] Loading model {WHISPER_MODEL_ID} on {_whisper_desc}...")
+    print(f"[Whisper] Loading model {_whisper_desc}...")
 
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        WHISPER_MODEL_ID,
+        model_id,
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
         cache_dir=WHISPER_MODEL_DIR,
     ).to(device)
-    processor = AutoProcessor.from_pretrained(WHISPER_MODEL_ID, cache_dir=WHISPER_MODEL_DIR)
+    processor = AutoProcessor.from_pretrained(model_id, cache_dir=WHISPER_MODEL_DIR)
 
     _whisper_pipe = pipeline(
         "automatic-speech-recognition",
@@ -218,7 +226,7 @@ def transcribe_audio_file(audio_path, timestamps=False, on_start=None):
             print(f"[Whisper] Empty transcript on {gpu}; retrying on the CPU")
             pipe = None
             _unload_whisper()
-            pipe = _load_whisper(device="cpu")
+            pipe = _load_whisper(device="cpu", fallback=True)
             result = run(pipe)
             if has_text(result):
                 _whisper_gpu_failed = True
@@ -1967,7 +1975,7 @@ def start_video_task(video_id, resolution='1080', transcribe=False, timestamps=F
 #
 # Authorization is optional and off by default: MCP_AUTH=off | token | oauth.
 
-SERVER_VERSION = '1.2.1'
+SERVER_VERSION = '1.2.2'
 SERVER_INFO = {'name': 'ytdl-web', 'title': 'ytdl-web YouTube Downloader', 'version': SERVER_VERSION}
 
 MCP_MODERN_VERSIONS = ['2026-07-28']
