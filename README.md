@@ -1,10 +1,12 @@
-# YouTube Downloader
+# <img src="static/icon-192.png" alt="" height="36"> YouTube Downloader
 
 A self-hosted server that downloads YouTube videos as MP3 or MP4 files. It can transcribe the audio to text or SRT subtitles with Whisper, and it can split the vocals from the background with UVR. Use it from the web page, or let an AI assistant such as Claude use it through MCP.
 
-| Audio | Video | History |
-|-------|-------|---------|
-| ![Audio](assets/audio.png) | ![Video](assets/videos.png) | ![History](assets/history.png) |
+| Download | Results |
+|----------|---------|
+| ![Download](assets/audio.png) | ![Results](assets/videos.png) |
+| **History** | **Settings** |
+| ![History](assets/history.png) | ![Settings](assets/settings.png) |
 
 ## Features
 
@@ -60,7 +62,7 @@ The server uses the UVR MDX-Net models from [Ultimate Vocal Remover](https://git
 
 For a video, each new file is an MP4 with the same picture. For audio, each new file is an MP3.
 
-On a CPU with 2 cores, the separation takes about as long as the song itself. A GPU is much faster. The first job downloads the model, which is about 67 MB.
+On a CPU with 2 cores, the separation takes about as long as the song itself. A GPU is much faster: a GTX 1650 separates a 3.5-minute song in about 30 seconds. The first job downloads the model, which is about 67 MB.
 
 ## Settings page
 
@@ -150,6 +152,7 @@ Set these values in the `environment:` section of `docker-compose.yml`. The Whis
 | `WHISPER_FALLBACK_MODEL_ID` | `openai/whisper-small` | The model used on the CPU when the GPU fails. It is about 2 times faster on a CPU than the default model |
 | `UVR_MODEL` | `inst_hq_3` | The UVR model for vocal separation: `inst_hq_3`, `inst_hq_4`, `kim_vocal_2`, or `voc_ft` |
 | `UVR_DEVICE` | `auto` | Like `WHISPER_DEVICE`, for vocal separation |
+| `UVR_MAX_MINUTES` | `60` | The longest audio that vocal separation accepts. Longer audio gets an error, because it needs more memory |
 
 To change the port, edit `ports:` in `docker-compose.yml`.
 

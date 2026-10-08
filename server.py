@@ -18,6 +18,7 @@ import socket
 import hmac
 import base64
 import hashlib
+import tempfile
 import threading
 import urllib.request
 from datetime import datetime, timezone
@@ -68,29 +69,40 @@ SETTINGS_FILE = Path(os.environ.get('SETTINGS_FILE', str(Path(WHISPER_MODEL_DIR)
 WHISPER_FALLBACK_MODEL_ID = os.environ.get('WHISPER_FALLBACK_MODEL_ID', 'openai/whisper-small')
 
 WHISPER_MODELS = [
-    ('openai/whisper-large-v3-turbo', 'Large v3 Turbo: accurate and fast (recommended)'),
-    ('openai/whisper-large-v3', 'Large v3: most accurate, slowest'),
+    ('openai/whisper-large-v3-turbo', 'Large v3 Turbo (recommended)'),
+    ('openai/whisper-large-v3', 'Large v3 (most accurate, slowest)'),
     ('openai/whisper-medium', 'Medium'),
-    ('openai/whisper-small', 'Small: fast on a CPU'),
-    ('openai/whisper-base', 'Base: fastest, least accurate'),
+    ('openai/whisper-small', 'Small (fast on a CPU)'),
+    ('openai/whisper-base', 'Base (fastest, least accurate)'),
 ]
+def _device_setting(value):
+    """auto, cpu or cuda:N. 'cuda' (the 1.2.x WHISPER_DEVICE value) means the first GPU."""
+    value = value.strip().lower()
+    return 'cuda:0' if value == 'cuda' else value
+
+
 # auto: the first GPU when PyTorch sees one, else the CPU. cpu / cuda:N: always that device.
 DEFAULT_SETTINGS = {
     'whisper_model': os.environ.get('WHISPER_MODEL_ID', 'openai/whisper-large-v3-turbo'),
-    'whisper_device': os.environ.get('WHISPER_DEVICE', 'auto').strip().lower(),
+    'whisper_device': _device_setting(os.environ.get('WHISPER_DEVICE', 'auto')),
     'uvr_model': os.environ.get('UVR_MODEL', 'inst_hq_3'),
-    'uvr_device': os.environ.get('UVR_DEVICE', 'auto').strip().lower(),
+    'uvr_device': _device_setting(os.environ.get('UVR_DEVICE', 'auto')),
 }
-_settings_lock = threading.Lock()
+_settings_lock = threading.Lock()       # guards SETTINGS
+_settings_save_lock = threading.Lock()  # one save at a time: check, write, apply
 
 
 def _read_settings():
     settings = dict(DEFAULT_SETTINGS)
+    if not SETTINGS_FILE.exists():
+        return settings
     try:
         saved = json.loads(SETTINGS_FILE.read_text(encoding='utf-8'))
         settings.update({k: v for k, v in saved.items() if k in settings and isinstance(v, str)})
-    except (OSError, ValueError, AttributeError):
-        pass
+    except (OSError, ValueError, AttributeError) as e:
+        print(f"[Settings] Ignoring {SETTINGS_FILE}, which cannot be read ({e}); using the defaults")
+    for key in ('whisper_device', 'uvr_device'):
+        settings[key] = _device_setting(settings[key])
     return settings
 
 
@@ -141,44 +153,65 @@ def settings_options():
     """The choices the Settings page offers."""
     devices = [{'id': 'auto', 'label': 'Automatic: GPU if there is one, else CPU'},
                {'id': 'cpu', 'label': 'CPU'}]
+    gpus = detect_gpus()
     devices += [{'id': g['id'], 'label': f"GPU {g['id'][5:]}: {g['name']} ({g['memory_gb']} GB)"}
-                for g in detect_gpus()]
+                for g in gpus]
+    # A saved or configured GPU that is gone stays selectable, so saving the page does not
+    # quietly turn it into Automatic.
+    with _settings_lock:
+        configured = (SETTINGS['whisper_device'], SETTINGS['uvr_device'], SETTINGS['whisper_model'])
+    for device in (DEFAULT_SETTINGS['whisper_device'], DEFAULT_SETTINGS['uvr_device'], *configured[:2]):
+        if device not in {d['id'] for d in devices}:
+            devices.append({'id': device, 'label': f'{device} (not found: uses the first GPU or the CPU)'})
     whisper = [{'id': m, 'label': label} for m, label in WHISPER_MODELS]
-    for model in (DEFAULT_SETTINGS['whisper_model'], setting('whisper_model')):
+    for model in (DEFAULT_SETTINGS['whisper_model'], configured[2]):
         if model not in {w['id'] for w in whisper}:
             whisper.append({'id': model, 'label': model})
-    uvr = [{'id': key, 'label': f"{m['label']}: best at the {m['primary']}"
+    uvr = [{'id': key, 'label': f"{m['label'].replace('UVR-MDX-NET ', '')}: {m['primary']}"
                                  + (' (recommended)' if key == 'inst_hq_3' else '')}
            for key, m in UVR_MODELS.items()]
-    return {'whisper_models': whisper, 'uvr_models': uvr, 'devices': devices, 'gpus': detect_gpus()}
+    return {'whisper_models': whisper, 'uvr_models': uvr, 'devices': devices, 'gpus': gpus}
 
 
 def save_settings(changes):
-    """Check and store new settings. Returns an error message, or None."""
+    """Check and store new settings. Returns an error message, or None.
+
+    Only values that differ from the defaults (the environment variables) go into the file, so
+    a field the user leaves alone keeps following docker-compose.yml.
+    """
     global _whisper_gpu_failed
-    options = settings_options()
-    allowed = {'whisper_model': options['whisper_models'], 'uvr_model': options['uvr_models'],
-               'whisper_device': options['devices'], 'uvr_device': options['devices']}
-    for name, value in changes.items():
-        if name not in allowed:
-            return f'Unknown setting: {name}'
-        if value not in {o['id'] for o in allowed[name]}:
-            return f'{name}: {value!r} is not one of the options'
-    with _settings_lock:
-        old_device = SETTINGS['whisper_device']
-        SETTINGS.update(changes)
-        saved = dict(SETTINGS)
-    try:
-        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = SETTINGS_FILE.with_suffix('.tmp')
-        tmp.write_text(json.dumps(saved, indent=2), encoding='utf-8')
-        os.replace(tmp, SETTINGS_FILE)
-    except OSError as e:
-        return f'Could not save the settings: {e}'
-    if saved['whisper_device'] != old_device:
-        # A new device choice is a fresh start for the GPU as well.
+    with _settings_save_lock:
+        options = settings_options()
+        allowed = {'whisper_model': options['whisper_models'], 'uvr_model': options['uvr_models'],
+                   'whisper_device': options['devices'], 'uvr_device': options['devices']}
+        for name, value in changes.items():
+            if name not in allowed:
+                return f'Unknown setting: {name}'
+            if not isinstance(value, str) or value not in {o['id'] for o in allowed[name]}:
+                return f'{name}: {value!r} is not one of the options'
+        with _settings_lock:
+            new = {**SETTINGS, **changes}
+            old_device = SETTINGS['whisper_device']
+        stored = {k: v for k, v in new.items() if v != DEFAULT_SETTINGS[k]}
+        try:
+            SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=SETTINGS_FILE.parent, prefix='.settings-', suffix='.tmp')
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(stored, f, indent=2)
+                os.replace(tmp, SETTINGS_FILE)
+            finally:
+                Path(tmp).unlink(missing_ok=True)
+        except OSError as e:
+            return f'Could not save the settings: {e}'
+        with _settings_lock:
+            SETTINGS.update(new)
+    if new['whisper_device'] != old_device:
+        # A new device choice is a fresh start for the GPU. A GPU transcription that is running
+        # now removes its own marker when it ends; if it crashes the server, the marker must stay.
         _whisper_gpu_failed = False
-        _set_gpu_marker(None)
+        if not (model_lock.locked() and _whisper_on_gpu):
+            _set_gpu_marker(None)
     print(f"[Settings] {', '.join(f'{k}={v}' for k, v in changes.items())}")
     return None
 
@@ -187,12 +220,13 @@ def settings_payload():
     """GET /api/settings: the current settings, the defaults, and the choices."""
     with _settings_lock:
         current = dict(SETTINGS)
+    running_on_gpu = model_lock.locked() and _whisper_on_gpu  # its marker is not a failure
     return {
         'settings': current,
         'defaults': DEFAULT_SETTINGS,
         'options': settings_options(),
         'uvr_gpu_supported': uvr_gpu_supported(),
-        'whisper_gpu_failed': _whisper_gpu_failed or _WHISPER_GPU_MARKER.exists(),
+        'whisper_gpu_failed': _whisper_gpu_failed or (_WHISPER_GPU_MARKER.exists() and not running_on_gpu),
     }
 
 
@@ -296,18 +330,31 @@ def _load_whisper(device=None, fallback=False):
     return _whisper_pipe
 
 
+_whisper_unload_lock = threading.Lock()  # whisper_release and separate_media can both unload
+
+
 def _unload_whisper():
     """Unload the Whisper model to free GPU/RAM."""
     global _whisper_pipe, _whisper_key, _whisper_on_gpu
-    if _whisper_pipe is None:
-        return
-    print("[Whisper] Unloading model to free resources...")
-    del _whisper_pipe
-    _whisper_pipe = None
-    _whisper_key = None
-    _whisper_on_gpu = False
+    with _whisper_unload_lock:
+        if _whisper_pipe is None:
+            return
+        print("[Whisper] Unloading model to free resources...")
+        _whisper_pipe = None
+        _whisper_key = None
+        _whisper_on_gpu = False
     _free_gpu_memory()
     print("[Whisper] Model unloaded.")
+
+
+def _is_gpu_error(e):
+    """True for errors from the GPU itself (out of memory, CUDA, cuDNN, cuBLAS), as opposed to a
+    failed model download, a bad model name or a file that cannot be decoded."""
+    if type(e).__name__ in ('OutOfMemoryError', 'AcceleratorError'):
+        return True
+    text = str(e).lower()
+    return isinstance(e, RuntimeError) and any(
+        word in text for word in ('cuda', 'cudnn', 'cublas', 'out of memory'))
 
 
 def _free_gpu_memory():
@@ -374,17 +421,17 @@ def transcribe_audio_file(audio_path, timestamps=False, on_start=None):
             result = run(pipe)
             problem = None if has_text(result) else 'empty transcript'
         except Exception as e:
-            if not device.startswith("cuda") or setting('whisper_device') != 'auto':
+            if not device.startswith("cuda") or setting('whisper_device') != 'auto' or not _is_gpu_error(e):
                 raise
             result, problem = {}, f'error ({e})'
         if problem and device.startswith("cuda") and setting('whisper_device') == 'auto':
             # Seen on one server (GTX 1650): GPU runs finished without an error but with no
             # text, and long ones crashed the process. Out of memory on a small card lands here.
             gpu = _whisper_desc
-            print(f"[Whisper] {problem.capitalize()} on {gpu}; retrying on the CPU")
+            print(f"[Whisper] {problem[:1].upper() + problem[1:]} on {gpu}; retrying on the CPU")
             pipe = None
             _unload_whisper()
-            _free_gpu_memory()
+            _free_gpu_memory()  # also when the GPU model never finished loading
             pipe = _load_whisper(device="cpu", fallback=True)
             result = run(pipe)
             if has_text(result):
@@ -568,6 +615,7 @@ def _uvr_run_windows(session, model, waves, hann):
 
 def uvr_separate(mix, key, model_dir, device='cpu', progress=None, batch_size=1):
     """Split a float32 [2, n] mix at 44.1 kHz into (vocals, background) with an MDX-Net model.
+    The mix array itself becomes one of the two stems, to save memory.
 
     device is 'cpu' or 'cuda:N'. progress(fraction) is called as windows finish. The network
     runs on batch_size windows (about 6 s of audio each) at a time, so its memory use does not
@@ -618,7 +666,10 @@ def uvr_separate(mix, key, model_dir, device='cpu', progress=None, batch_size=1)
             torch.cuda.empty_cache()
         gc.collect()
 
-    secondary = mix - primary
+    # In place: the mix becomes the second stem, so a long file needs two copies, not three.
+    # The caller's array is overwritten.
+    np.subtract(mix, primary, out=mix)
+    secondary = mix
     print(f"[UVR] Done in {time.monotonic() - started:.0f} s")
     if model['primary'] == 'vocals':
         return primary, secondary
@@ -723,7 +774,7 @@ def uvr_save_mp3(stem, out_path, quality=None, bitrate=None):
 def uvr_save_video(stem, video_path, out_path, audio_bitrate=192):
     """Write an MP4 with the first video stream of video_path (copied) and the stem as AAC audio."""
     _uvr_ffmpeg(['-i', str(video_path), *_uvr_raw_input(), '-map', '0:v:0', '-map', '1:a:0',
-                 '-c:v', 'copy', '-c:a', 'aac', '-b:a', f'{int(audio_bitrate)}k', '-shortest',
+                 '-c:v', 'copy', '-c:a', 'aac', '-b:a', f'{int(audio_bitrate)}k',
                  '-y', str(out_path)], feed=_uvr_feed(stem))
 
 
@@ -740,12 +791,29 @@ def uvr_gpu_supported():
         return False
 
 
-def separate_media(task_id, media_file, keep, mp3_quality=None):
+# The decoded audio and both stems stay in RAM (about 21 MB per minute each), so a very long
+# file could take the server down. Longer audio gets a separation_error instead.
+try:
+    UVR_MAX_MINUTES = max(1, int(os.environ.get('UVR_MAX_MINUTES', '60')))
+except ValueError:
+    UVR_MAX_MINUTES = 60
+
+
+def _stem_path(media_file, stem, video):
+    """'<name> (Vocals).mp3' next to media_file, shortened to fit the 255-byte file name limit."""
+    suffix = f' ({STEM_LABELS[stem]}){".mp4" if video else ".mp3"}'
+    name = media_file.stem
+    while len((name + suffix).encode('utf-8')) > 255:
+        name = name[:-1]
+    return media_file.with_name(name + suffix)
+
+
+def separate_media(task_id, media_file, keep, mp3_quality=None, on_saved=None):
     """Split a file's audio into vocals and background with UVR.
 
     Saves '<name> (Vocals).<ext>' and/or '<name> (Background).<ext>' next to media_file for each
-    stem in keep: MP3s for an MP3, MP4s with the original video for a video. Returns
-    {stem: path}.
+    stem in keep: MP3s for an MP3, MP4s with the original video for a video. on_saved(stem,
+    path) is called as each file is saved, so a failure on the second keeps the first.
     """
     video = media_file.suffix.lower() != '.mp3'
 
@@ -762,26 +830,42 @@ def separate_media(task_id, media_file, keep, mp3_quality=None):
             key = 'inst_hq_3'
         choice = setting('uvr_device')
         device = resolve_device(choice)
+        uvr_model_path(key, UVR_MODEL_DIR)  # a failed download is not a GPU problem: no retry
+        # Whisper stays loaded while more transcriptions are waiting. Free its RAM or VRAM for
+        # UVR (on a 4 GB GPU they do not fit together); the next transcription reloads it.
+        _unload_whisper()
         mix = uvr_load_audio(media_file)
+        minutes = mix.shape[1] / UVR_SAMPLE_RATE / 60
+        if minutes > UVR_MAX_MINUTES:
+            raise RuntimeError(f'The audio is {minutes:.0f} minutes long; vocal separation is limited to '
+                               f'{UVR_MAX_MINUTES} minutes (UVR_MAX_MINUTES)')
         try:
             vocals, background = uvr_separate(mix, key, UVR_MODEL_DIR, device, progress)
-        except RuntimeError as e:
+        except Exception as e:  # onnxruntime's GPU errors are not RuntimeErrors
             if device == 'cpu' or choice != 'auto':
                 raise
-            print(f"[UVR] {device} failed ({e}); retrying on the CPU")
+            print(f"[UVR] {device} failed ({str(e) or type(e).__name__}); retrying on the CPU")
             vocals, background = uvr_separate(mix, key, UVR_MODEL_DIR, 'cpu', progress)
         del mix
-    _set_task_message(task_id, 'Saving the separated files...', 97)
-    stems = {}
-    for stem, audio in (('vocals', vocals), ('background', background)):
-        if stem in keep:
-            path = media_file.with_name(f'{media_file.stem} ({STEM_LABELS[stem]})'
-                                        f'{".mp4" if video else ".mp3"}')
-            if video:
-                uvr_save_video(audio, media_file, path)
-            else:
-                uvr_save_mp3(audio, path, quality=mp3_quality)
+        # Encode inside the lock: the next job's separation must not start while both stems
+        # are still in memory.
+        _set_task_message(task_id, 'Saving the separated files...', 97)
+        stems = {}
+        for stem, audio in (('vocals', vocals), ('background', background)):
+            if stem not in keep:
+                continue
+            path = _stem_path(media_file, stem, video)
+            try:
+                if video:
+                    uvr_save_video(audio, media_file, path)
+                else:
+                    uvr_save_mp3(audio, path, quality=mp3_quality)
+            except Exception:
+                path.unlink(missing_ok=True)  # no half-written file left for the listings
+                raise
             stems[stem] = path
+            if on_saved is not None:
+                on_saved(stem, path)
     return stems
 
 
@@ -1434,14 +1518,14 @@ HTML_PAGE = '''<!DOCTYPE html>
         .ai-check { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
         .ai-check input { width: 18px; height: 18px; cursor: pointer; accent-color: #ff0000; flex-shrink: 0; }
         .ai-title { font-size: 14px; color: #f1f1f1; }
-        .ai-hint { font-size: 11px; color: #717171; margin-top: 2px; }
+        .ai-hint { font-size: 11px; color: #9a9a9a; margin-top: 2px; }
         .stem-choices { display: none; gap: 8px; margin-top: 10px; padding-left: 28px; }
         .stem-choices.show { display: flex; }
         .stem-choice { flex: 1; cursor: pointer; }
         .stem-choice input { position: absolute; opacity: 0; pointer-events: none; }
         .stem-choice span { display: block; height: 100%; padding: 10px 8px; border: 1px solid #3f3f3f; border-radius: 8px; background: #121212; text-align: center; transition: all 0.2s; }
         .stem-choice b { display: block; font-size: 13px; font-weight: 500; color: #f1f1f1; }
-        .stem-choice small { display: block; font-size: 11px; color: #717171; margin-top: 3px; }
+        .stem-choice small { display: block; font-size: 11px; color: #9a9a9a; margin-top: 3px; }
         .stem-choice span:hover { border-color: #717171; }
         .stem-choice input:checked + span { border-color: #ff0000; background: rgba(255, 0, 0, 0.1); }
         .stem-choice input:focus-visible + span { outline: 2px solid #3ea6ff; }
@@ -1452,8 +1536,10 @@ HTML_PAGE = '''<!DOCTYPE html>
         .extra-downloads .download-btn:hover { background: #3f3f3f; }
         .step-error { margin-top: 8px; font-size: 13px; color: #ff6b6b; }
 
-        /* Labeled extra downloads in the history */
-        .history-extra-btn { height: 32px; padding: 0 10px; background: #272727; border: none; border-radius: 6px; color: #f1f1f1; font-size: 11px; cursor: pointer; white-space: nowrap; transition: all 0.2s; }
+        /* Labeled extra downloads in the history, as a row under the badges */
+        .history-extras { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+        .history-extras:empty { display: none; }
+        .history-extra-btn { height: 26px; padding: 0 10px; background: #272727; border: none; border-radius: 6px; color: #f1f1f1; font-size: 11px; cursor: pointer; white-space: nowrap; transition: all 0.2s; }
         .history-extra-btn:hover { background: #3f3f3f; }
         .history-extra-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
@@ -1462,7 +1548,7 @@ HTML_PAGE = '''<!DOCTYPE html>
         .gpu-list b { color: #f1f1f1; font-weight: 500; }
         .settings-card { background: #1a1a1a; border: 1px solid #272727; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
         .settings-card h3 { font-size: 15px; font-weight: 500; color: #f1f1f1; }
-        .settings-card p { font-size: 12px; color: #717171; margin-top: 4px; }
+        .settings-card p { font-size: 12px; color: #9a9a9a; margin-top: 4px; }
         .settings-row { display: grid; grid-template-columns: 90px 1fr; align-items: center; gap: 10px; margin-top: 12px; }
         .settings-row label { font-size: 13px; color: #aaa; }
         .settings-note { display: none; font-size: 12px; color: #f0b429; margin-top: 10px; }
@@ -1474,6 +1560,9 @@ HTML_PAGE = '''<!DOCTYPE html>
         @media (max-width: 600px) {
             .stem-choices { flex-direction: column; padding-left: 0; }
             .settings-row { grid-template-columns: 1fr; gap: 4px; }
+            .settings-row .quality-select { font-size: 13px; padding: 10px 12px; }
+            .history-actions { flex-wrap: wrap; }
+            .history-download-btn, .history-delete-btn { flex-shrink: 0; }
         }
     </style>
 </head>
@@ -1642,7 +1731,7 @@ HTML_PAGE = '''<!DOCTYPE html>
 
             <div class="settings-card">
                 <h3>Vocal separation (UVR MDX-Net)</h3>
-                <p>Splits the voice from the music. Both models make both files; each is best at its own part.</p>
+                <p>Splits the voice from the music. Every model makes both files; each is best at the part in its name.</p>
                 <div class="settings-row">
                     <label for="setUvrModel">Model</label>
                     <select class="quality-select" id="setUvrModel"></select>
@@ -1670,6 +1759,7 @@ HTML_PAGE = '''<!DOCTYPE html>
         let currentTitle = '';
         let currentMode = 'audio';
         let currentView = 'download';
+        let polling = false;  // a job started on this page is still running
 
         // Track background polling for resumed tasks
         const backgroundPolls = {};
@@ -1733,7 +1823,8 @@ HTML_PAGE = '''<!DOCTYPE html>
             if (view === 'history') { loadHistory(); return; }
             if (view === 'settings') { loadSettings(); return; }
 
-            // Audio/Video tabs
+            // Audio/Video tabs. A finished result belongs to the tab it came from.
+            if (mode !== currentMode && !polling) { hideDownload(); hideStatus(); }
             currentMode = mode;
             document.getElementById('audioQuality').style.display = mode === 'audio' ? 'block' : 'none';
             document.getElementById('videoQuality').style.display = mode === 'video' ? 'block' : 'none';
@@ -1879,6 +1970,11 @@ HTML_PAGE = '''<!DOCTYPE html>
                                 ${isProcessing ? '<span class="history-badge badge-processing">Processing...</span>' : ''}
                                 <span class="history-date">${formatDate(item.date)}</span>
                             </div>
+                            ${isProcessing ? '' : `<div class="history-extras">
+                                ${extraButton(item.vocals_url, 'Vocals', 'Download the vocals only', exists)}
+                                ${extraButton(item.background_url, 'Background', 'Download the background only (no vocals)', exists)}
+                                ${extraButton(item.transcription_url, 'Transcript', 'Download the transcript', exists)}
+                            </div>`}
                             ${!isProcessing && !exists ? '<div class="deleted-tooltip">File no longer available on server</div>' : ''}
                         </div>
                         <div class="history-actions">
@@ -1888,9 +1984,6 @@ HTML_PAGE = '''<!DOCTYPE html>
                                     title="${exists ? 'Download' : 'File unavailable'}">
                                 <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
                             </button>
-                            ${extraButton(item.vocals_url, 'Vocals', 'Download the vocals only', exists)}
-                            ${extraButton(item.background_url, 'Background', 'Download the background only (no vocals)', exists)}
-                            ${extraButton(item.transcription_url, 'Transcript', 'Download the transcript', exists)}
                             <button class="history-delete-btn" onclick="deleteHistoryItem('${item.task_id}')" title="Delete">
                                 <svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
                             </button>
@@ -2011,6 +2104,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 addToHistory(window.currentConversion);
                 showStatus('Downloading...');
                 document.getElementById('convertBtn').disabled = false;
+                polling = true;
                 pollInterval = setInterval(checkStatus, 500);
             })
             .catch(err => {
@@ -2028,6 +2122,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 .then(data => {
                     if (data.status === 'completed') {
                         clearInterval(pollInterval);
+                        polling = false;
                         setProgress(100);
                         showStatus('Complete!');
                         showDownload(data.filename, data.download_url);
@@ -2042,6 +2137,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                         if (currentView === 'history') loadHistory();
                     } else if (data.status === 'error') {
                         clearInterval(pollInterval);
+                        polling = false;
                         showError(data.error || 'Download failed');
                         hideStatus();
                         updateActiveCount();
@@ -2052,7 +2148,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                         }
                         if (currentView === 'history') loadHistory();
                     } else if (data.status === 'processing') {
-                        const progress = data.progress || 0;
+                        const progress = data.overall_progress ?? data.progress ?? 0;
                         setProgress(Math.min(99, progress));
                         if (data.message) showStatus(data.message);
                     }
@@ -2126,7 +2222,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 ? '<b>GPUs found:</b> ' + gpus.map(g => escapeHtml(`GPU ${g.id.slice(5)}: ${g.name} (${g.memory_gb} GB)`)).join(', ')
                 : '<b>No NVIDIA GPU found.</b> Whisper and UVR run on the CPU, which is slower.';
             const whisperNote = document.getElementById('whisperNote');
-            whisperNote.textContent = data.whisper_gpu_failed && data.settings.whisper_device === 'auto'
+            whisperNote.textContent = gpus.length && data.whisper_gpu_failed && data.settings.whisper_device === 'auto'
                 ? 'The GPU failed a transcription before, so Automatic uses the CPU. Pick a GPU above to try it again.' : '';
             whisperNote.classList.toggle('show', !!whisperNote.textContent);
             const uvrNote = document.getElementById('uvrNote');
@@ -2351,6 +2447,11 @@ def run_ytdlp(task_id, cmd, timeout, downloading_message, finishing_message):
         time.sleep(2 * attempt)
 
 
+def _ai_steps(keep, transcribe):
+    """The AI steps a job runs after its download, for the progress scale."""
+    return (('separate',) if keep else ()) + (('transcribe',) if transcribe else ())
+
+
 def _finish_media(task_id, task_dir, media_file, result, transcribe, timestamps, keep, mp3_quality=None):
     """The optional AI steps after a download: UVR separation, then Whisper transcription.
 
@@ -2362,13 +2463,14 @@ def _finish_media(task_id, task_dir, media_file, result, transcribe, timestamps,
         # now, so plain downloads do not wait behind them.
         release_job_slot(task_id)
     if keep:
+        def saved(stem, path):
+            result[f'{stem}_filename'] = path.name
+            result[f'{stem}_url'] = f'/download/{task_id}/{quote(path.name)}'
         try:
-            for stem, path in separate_media(task_id, media_file, keep, mp3_quality).items():
-                result[f'{stem}_filename'] = path.name
-                result[f'{stem}_url'] = f'/download/{task_id}/{quote(path.name)}'
+            separate_media(task_id, media_file, keep, mp3_quality, on_saved=saved)
         except Exception as e:
-            print(f"[UVR] Separation failed for task {task_id}: {e}")
-            result['separation_error'] = str(e)
+            print(f"[UVR] Separation failed for task {task_id}: {e!r}")
+            result['separation_error'] = str(e) or type(e).__name__
     if transcribe:
         try:
             _set_task_message(task_id, 'Waiting for another AI job to finish...'
@@ -2381,8 +2483,8 @@ def _finish_media(task_id, task_dir, media_file, result, transcribe, timestamps,
             result['transcription_url'] = f'/download/{task_id}/{quote(transcript_name)}'
             result['transcription_filename'] = transcript_name
         except Exception as e:
-            print(f"[Whisper] Transcription failed for task {task_id}: {e}")
-            result['transcription_error'] = str(e)
+            print(f"[Whisper] Transcription failed for task {task_id}: {e!r}")
+            result['transcription_error'] = str(e) or type(e).__name__
 
 
 def download_and_convert(task_id, url, bitrate='320', transcribe=False, timestamps=False, keep=()):
@@ -2392,6 +2494,7 @@ def download_and_convert(task_id, url, bitrate='320', transcribe=False, timestam
             active_downloads[task_id] = {
                 'status': 'processing',
                 'progress': 0,
+                'steps': _ai_steps(keep, transcribe),
                 'message': 'Starting download...'
             }
 
@@ -2470,6 +2573,7 @@ def download_video(task_id, url, resolution='1080', transcribe=False, timestamps
             active_downloads[task_id] = {
                 'status': 'processing',
                 'progress': 0,
+                'steps': _ai_steps(keep, transcribe),
                 'message': 'Starting video download...'
             }
 
@@ -2608,6 +2712,22 @@ def _run_job(target, args):
         target(*args)
     finally:
         release_job_slot(args[0])
+
+
+class BadRequest(Exception):
+    """A web API request with an invalid value (HTTP 400)."""
+
+
+def _api_flag(data, name):
+    """A true/false field of a web API request: a JSON boolean, 1/0, or "true"/"false"/"yes"/"no"."""
+    value = data.get(name)
+    if value is None or isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in ('true', 'false', 'yes', 'no', '1', '0'):
+        return value.strip().lower() in ('true', 'yes', '1')
+    raise BadRequest(f'{name} must be true or false (got {value!r})')
 
 
 def stems_to_keep(remove_vocals=False, remove_background=False):
@@ -3046,7 +3166,7 @@ def _reported_progress_locked(entry):
     The raw value restarts for each stream and phase (see _overall_progress), so a poll could
     otherwise see 100 while the job still runs, or 90 followed by 10. Hold downloads_lock.
     """
-    value = max(_overall_progress(entry.get('progress'), entry.get('message')),
+    value = max(_overall_progress(entry.get('progress'), entry.get('message'), entry.get('steps', ())),
                 entry.get('reported_progress', 0.0))
     entry['reported_progress'] = value
     return round(value, 1)
@@ -3083,20 +3203,27 @@ def task_snapshot(task_id, base_url, transcript_chars=MCP_INLINE_TRANSCRIPT_CHAR
         raise ToolError(f'Unknown or expired task_id {task_id}. Files are deleted 1-2 hours after '
                         'the job finishes; start a new download.')
     found = {}  # role -> path: file (the original), vocals, background, transcript
-    for path in _finished_files(task_dir):
-        ext = path.suffix.lower()
-        if ext in TRANSCRIPT_EXTS:
-            found.setdefault('transcript', path)
-        elif ext in MEDIA_EXTS:
-            stem = next((s for s in STEMS if path.stem.endswith(f' ({STEM_LABELS[s]})')), None)
-            found.setdefault(stem or 'file', path)
-    # The names the job recorded beat the guesses above (a title can end in "(Vocals)").
-    for role, key, ext_ok in (('file', 'filename', MEDIA_EXTS), ('vocals', 'vocals_filename', MEDIA_EXTS),
-                              ('background', 'background_filename', MEDIA_EXTS),
-                              ('transcript', 'transcription_filename', tuple(TRANSCRIPT_EXTS))):
-        named = resolve_task_file(task_id, entry.get(key) or '')
-        if named is not None and named.is_file() and named.suffix.lower() in ext_ok:
-            found[role] = named
+    if entry.get('filename'):
+        # The job's own record names every file it made (a title can end in "(Vocals)").
+        for role, key, ext_ok in (('file', 'filename', MEDIA_EXTS), ('vocals', 'vocals_filename', MEDIA_EXTS),
+                                  ('background', 'background_filename', MEDIA_EXTS),
+                                  ('transcript', 'transcription_filename', tuple(TRANSCRIPT_EXTS))):
+            named = resolve_task_file(task_id, entry.get(key) or '')
+            if named is not None and named.is_file() and named.suffix.lower() in ext_ok:
+                found[role] = named
+    else:
+        # No record (a server restart emptied active_downloads): guess from the file names.
+        for path in _finished_files(task_dir):
+            ext = path.suffix.lower()
+            if ext in TRANSCRIPT_EXTS:
+                found.setdefault('transcript', path)
+            elif ext in MEDIA_EXTS:
+                stem = next((s for s in STEMS if path.stem.endswith(f' ({STEM_LABELS[s]})')), None)
+                found.setdefault(stem or 'file', path)
+        if 'file' not in found and len([r for r in found if r in STEMS]) == 1:
+            # A lone "(Vocals)" or "(Background)" file is more likely the original's own title.
+            stem = next(r for r in found if r in STEMS)
+            found['file'] = found.pop(stem)
     if 'file' not in found and 'transcript' not in found:
         raise ToolError(f'Task {task_id} has no finished files (it may have been interrupted). '
                         'Start a new download.')
@@ -3119,26 +3246,36 @@ def task_snapshot(task_id, base_url, transcript_chars=MCP_INLINE_TRANSCRIPT_CHAR
     return out
 
 
-def _overall_progress(raw, message):
+def _overall_progress(raw, message, steps=()):
     """Map the per-phase progress a job reports onto one 0-100 scale.
 
     The raw value restarts per phase (yt-dlp download reaches 100, then extraction reports
     95, separation 96 and transcription 98), so the phase is taken from the status message.
+    steps ('separate', 'transcribe') are the AI steps the job will run: they take most of the
+    time, so they get most of the scale (download 0-30, then an equal share each, up to 98).
     """
     message = (message or '').lower()
+    ai = [s for s in ('separate', 'transcribe') if s in steps]
+    download_end = 30.0 if ai else 90.0
+    spans, start = {}, download_end + 2
+    for step in ai:
+        spans[step] = (start, start + (98.0 - download_end - 2) / len(ai))
+        start = spans[step][1]
+    separate = spans.get('separate', (93.0, 94.0))
+    transcribe = spans.get('transcribe', (95.0, 95.0))
     if 'transcri' in message:
-        return 95.0
+        return transcribe[0]
     if 'saving the separated' in message:
-        return 94.0
+        return separate[1]
     if 'separating' in message:  # "Separating vocals and background... 45%"
         match = re.search(r'(\d+)%', message)
-        return 93.0 + (int(match.group(1)) / 100 if match else 0.0)
-    if 'waiting for another ai job' in message:
-        return 93.0
+        return separate[0] + (int(match.group(1)) / 100 if match else 0.0) * (separate[1] - separate[0])
+    if 'waiting for another ai job' in message:  # raw 96 before separation, 98 before transcription
+        return transcribe[0] if (raw or 0) >= 98 else separate[0]
     if 'convert' in message or 'merg' in message:
-        return 92.0
+        return download_end + 1
     try:
-        return min(90.0, float(raw or 0) * 0.9)
+        return min(download_end, float(raw or 0) * download_end / 100)
     except (TypeError, ValueError):
         return 0.0
 
@@ -4190,7 +4327,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path.startswith('/api/check/'):
             task_id = path.split('/')[-1]
             with downloads_lock:
-                task = active_downloads.get(task_id, {'status': 'not_found'})
+                live = active_downloads.get(task_id)
+                task = dict(live) if live else {'status': 'not_found'}
+                if task.get('status') == 'processing':
+                    # One 0-100 scale for the page's progress bar that never goes back; the raw
+                    # 'progress' restarts for each stream and step.
+                    task['overall_progress'] = _reported_progress_locked(live)
             self.send_json(task)
             return
 
@@ -4301,7 +4443,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 bitrate = data.get('bitrate', '320')
                 transcribe = data.get('transcribe', False)
                 timestamps = data.get('timestamps', False)
-                keep = stems_to_keep(data.get('remove_vocals') is True, data.get('remove_background') is True)
+                keep = stems_to_keep(_api_flag(data, 'remove_vocals'), _api_flag(data, 'remove_background'))
 
                 # Validate URL
                 video_id = extract_video_id(url)
@@ -4314,6 +4456,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             except QueueFull as e:
                 self.send_json({'error': str(e)}, 503)
+            except BadRequest as e:
+                self.send_json({'error': str(e)}, 400)
             except json.JSONDecodeError:
                 self.send_json({'error': 'Invalid JSON'}, 400)
             except Exception as e:
@@ -4328,7 +4472,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 resolution = data.get('resolution', '1080')
                 transcribe = data.get('transcribe', False)
                 timestamps = data.get('timestamps', False)
-                keep = stems_to_keep(data.get('remove_vocals') is True, data.get('remove_background') is True)
+                keep = stems_to_keep(_api_flag(data, 'remove_vocals'), _api_flag(data, 'remove_background'))
 
                 # Validate URL
                 video_id = extract_video_id(url)
@@ -4341,6 +4485,8 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             except QueueFull as e:
                 self.send_json({'error': str(e)}, 503)
+            except BadRequest as e:
+                self.send_json({'error': str(e)}, 400)
             except json.JSONDecodeError:
                 self.send_json({'error': 'Invalid JSON'}, 400)
             except Exception as e:
