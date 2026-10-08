@@ -113,6 +113,7 @@ Set these values in the `environment:` section of `docker-compose.yml`.
 | `YTDLP_AUTO_UPDATE` | `1` | Updates yt-dlp each time the container starts |
 | `YTDLP_RETRIES` | `3` | The number of retries when YouTube refuses a download or yt-dlp crashes |
 | `WHISPER_MODEL_ID` | `openai/whisper-large-v3-turbo` | The Whisper model. Smaller models, such as `openai/whisper-small`, are faster |
+| `WHISPER_DEVICE` | `auto` | `auto` uses the GPU if there is one. Set `cpu` to always use the CPU |
 
 To change the port, edit `ports:` in `docker-compose.yml`.
 
@@ -127,6 +128,7 @@ To change the port, edit `ports:` in `docker-compose.yml`.
 | The browser asks for a password | `WEB_AUTH_PASSWORD` is set. Log in as `admin`, or as the user in `WEB_AUTH_USER`. |
 | An MCP client gets error 401 | `MCP_AUTH` is on. Add the token to the client. |
 | Transcription is slow | Without a GPU, Whisper runs on the CPU. Use a smaller `WHISPER_MODEL_ID`. |
+| "Transcription failed: Whisper returned an empty transcript", or the server restarts during a transcription | Some GPUs cannot run Whisper. The server then switches to the CPU by itself. To skip the GPU, set `WHISPER_DEVICE=cpu`. |
 | The first transcription is slow | The first run downloads the Whisper model, which is about 1.6 GB. |
 | Other devices cannot connect | Make sure that your firewall allows port 6080. |
 

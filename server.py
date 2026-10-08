@@ -60,24 +60,67 @@ downloads_lock = threading.Lock()
 # Whisper transcription state
 WHISPER_MODEL_ID = os.environ.get('WHISPER_MODEL_ID', 'openai/whisper-large-v3-turbo')
 WHISPER_MODEL_DIR = os.environ.get('WHISPER_MODEL_DIR', str(Path(__file__).parent / 'whisper-model'))
+# auto: the GPU when PyTorch sees one, else the CPU. cpu / cuda: always that device.
+WHISPER_DEVICE = os.environ.get('WHISPER_DEVICE', 'auto').strip().lower()
+# Exists while a GPU transcription runs, and stays when the GPU gave an empty transcript that the
+# CPU did not. If it is there when the model loads, a GPU transcription failed or took the whole
+# server down (seen on one server: short clips came back empty and long ones crashed the
+# process), so auto mode uses the CPU instead.
+_WHISPER_GPU_MARKER = Path(WHISPER_MODEL_DIR) / 'gpu-transcription-failed'
 whisper_lock = threading.Lock()  # Serializes transcription (pipeline not thread-safe)
 _whisper_pipe = None
+_whisper_on_gpu = False
+_whisper_desc = ''  # Where the loaded model runs, for log lines and error messages
+_whisper_gpu_failed = False  # The GPU failed (empty transcript or crash); use the CPU
 _whisper_refcount = 0
 _whisper_refcount_lock = threading.Lock()
 
 
-def _load_whisper():
+def _whisper_device(cuda_available):
+    """Pick the device for the next model load: 'cuda' or 'cpu'."""
+    global _whisper_gpu_failed
+    if not cuda_available or WHISPER_DEVICE == 'cpu' or _whisper_gpu_failed:
+        return 'cpu'
+    if WHISPER_DEVICE == 'auto' and _WHISPER_GPU_MARKER.exists():
+        _whisper_gpu_failed = True
+        print(f"[Whisper] A GPU transcription failed before: it crashed the server or gave no text "
+              f"({_WHISPER_GPU_MARKER}). Whisper uses the CPU. Delete that file, or set "
+              "WHISPER_DEVICE=cuda, to try the GPU again.")
+        return 'cpu'
+    return 'cuda'
+
+
+def _set_gpu_marker(note):
+    """Write note into the GPU marker file, or remove the file when note is None."""
+    try:
+        if note is None:
+            _WHISPER_GPU_MARKER.unlink(missing_ok=True)
+        else:
+            _WHISPER_GPU_MARKER.write_text(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {note}\n")
+    except OSError:
+        pass
+
+
+def _load_whisper(device=None):
     """Load the Whisper model on demand. Returns the ASR pipeline."""
-    global _whisper_pipe
+    global _whisper_pipe, _whisper_on_gpu, _whisper_desc
     if _whisper_pipe is not None:
         return _whisper_pipe
 
     import torch
+    import transformers
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device is None:
+        device = _whisper_device(torch.cuda.is_available())
     dtype = torch.float16 if device == "cuda" else torch.float32
-    print(f"[Whisper] Loading model {WHISPER_MODEL_ID} on {device}...")
+    if device == "cuda":
+        hardware = torch.cuda.get_device_name(0)
+    else:
+        hardware = f"{torch.get_num_threads()} threads, {torch.backends.cpu.get_cpu_capability()}"
+    _whisper_desc = (f"{device} ({hardware}), {str(dtype).replace('torch.', '')}; "
+                     f"torch {torch.__version__}, transformers {transformers.__version__}")
+    print(f"[Whisper] Loading model {WHISPER_MODEL_ID} on {_whisper_desc}...")
 
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         WHISPER_MODEL_ID,
@@ -95,18 +138,20 @@ def _load_whisper():
         dtype=dtype,
         device=device,
     )
+    _whisper_on_gpu = device == "cuda"
     print("[Whisper] Model loaded successfully.")
     return _whisper_pipe
 
 
 def _unload_whisper():
     """Unload the Whisper model to free GPU/RAM."""
-    global _whisper_pipe
+    global _whisper_pipe, _whisper_on_gpu
     if _whisper_pipe is None:
         return
     print("[Whisper] Unloading model to free resources...")
     del _whisper_pipe
     _whisper_pipe = None
+    _whisper_on_gpu = False
     gc.collect()
     try:
         import torch
@@ -148,11 +193,44 @@ def transcribe_audio_file(audio_path, timestamps=False, on_start=None):
     """Transcribe an audio file using Whisper. Queued via whisper_lock (one at a time).
     If timestamps=True, returns SRT-formatted string. Otherwise plain text.
     on_start() is called once this file's turn comes."""
+    global _whisper_gpu_failed
+
+    def has_text(result):
+        return bool((result.get("text") or "").strip())
+
+    def run(pipe):
+        if not _whisper_on_gpu:
+            return pipe(audio_path, return_timestamps=True)
+        _set_gpu_marker(f'transcription running on {_whisper_desc}')
+        try:
+            return pipe(audio_path, return_timestamps=True)
+        finally:
+            _set_gpu_marker(None)
+
     with whisper_lock:
         if on_start is not None:
             on_start()
         pipe = _load_whisper()
-        result = pipe(audio_path, return_timestamps=True)
+        result = run(pipe)
+        if not has_text(result) and _whisper_on_gpu and WHISPER_DEVICE == 'auto':
+            # Seen on one server: every GPU run finished without an error but with no text.
+            gpu = _whisper_desc
+            print(f"[Whisper] Empty transcript on {gpu}; retrying on the CPU")
+            pipe = None
+            _unload_whisper()
+            pipe = _load_whisper(device="cpu")
+            result = run(pipe)
+            if has_text(result):
+                _whisper_gpu_failed = True
+                _set_gpu_marker(f'empty transcript on {gpu}; the CPU worked')
+                print(f"[Whisper] The CPU worked, so Whisper uses the CPU from now on. Delete "
+                      f"{_WHISPER_GPU_MARKER}, or set WHISPER_DEVICE=cuda, to try the GPU again.")
+        where = _whisper_desc
+
+    # A job must not report success with a blank transcript file. The callers store this as
+    # transcription_error, which the web page and MCP results show.
+    if not has_text(result):
+        raise RuntimeError(f"Whisper returned an empty transcript ({where})")
 
     if not timestamps:
         return result["text"]
@@ -916,6 +994,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                     <svg viewBox="0 0 24 24" style="width:18px;height:18px;"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm-1 9h-2v2H9v-2H7v-2h2V7h2v2h2v2zm-1-8.5L16.5 7H12V2.5z"/></svg>
                     <span id="transcriptionText">Download Transcription</span>
                 </a>
+                <div id="transcriptionError" style="display:none; margin-top: 8px; font-size: 13px; color: #ff6b6b;"></div>
             </div>
 
             <div class="server-status">
@@ -1310,6 +1389,9 @@ HTML_PAGE = '''<!DOCTYPE html>
                         } else {
                             document.getElementById('transcriptionBtn').style.display = 'none';
                         }
+                        const tErr = document.getElementById('transcriptionError');
+                        tErr.textContent = data.transcription_error ? 'Transcription failed: ' + data.transcription_error : '';
+                        tErr.style.display = data.transcription_error ? 'block' : 'none';
                         updateActiveCount();
 
                         // Update history entry with completed info
@@ -1362,6 +1444,7 @@ HTML_PAGE = '''<!DOCTYPE html>
         function hideDownload() {
             document.getElementById('downloadSection').classList.remove('show');
             document.getElementById('transcriptionBtn').style.display = 'none';
+            document.getElementById('transcriptionError').style.display = 'none';
         }
         function showError(msg) {
             document.getElementById('error').textContent = msg;
@@ -1884,7 +1967,7 @@ def start_video_task(video_id, resolution='1080', transcribe=False, timestamps=F
 #
 # Authorization is optional and off by default: MCP_AUTH=off | token | oauth.
 
-SERVER_VERSION = '1.2.0'
+SERVER_VERSION = '1.2.1'
 SERVER_INFO = {'name': 'ytdl-web', 'title': 'ytdl-web YouTube Downloader', 'version': SERVER_VERSION}
 
 MCP_MODERN_VERSIONS = ['2026-07-28']
