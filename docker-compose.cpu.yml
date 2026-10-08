@@ -1,0 +1,38 @@
+# For machines without an NVIDIA GPU: Whisper and UVR run on the CPU.
+#   docker compose -f docker-compose.cpu.yml up -d --build
+# With an NVIDIA GPU, use docker-compose.yml (the default) instead.
+services:
+  ytdl-web:
+    build: .
+    container_name: ytdl-web
+    ports:
+      - "0.0.0.0:6080:8080"
+    volumes:
+      # Persist downloads (optional - remove if you don't need to keep files)
+      - ./downloads:/app/downloads
+      # Persist Whisper model cache so it doesn't re-download on container rebuild
+      - whisper-model:/app/whisper-model
+    restart: always
+    environment:
+      - PYTHONUNBUFFERED=1
+      - EXTERNAL_PORT=6080
+      - WHISPER_MODEL_DIR=/app/whisper-model
+      # Refresh yt-dlp on every container start. YouTube breaks extraction every few
+      # weeks; this makes `docker compose restart` the fix. Set to 0 to pin to the image.
+      - YTDLP_AUTO_UPDATE=1
+      # MCP server for AI assistants at http://<host>:6080/mcp - see README "MCP Server".
+      # No auth by default, which is the same exposure as the web UI. For a bearer token:
+      #   MCP_AUTH=token and MCP_AUTH_TOKEN=<32+ random chars>
+      # For OAuth (e.g. claude.ai connectors), see README for MCP_AUTH=oauth.
+      # MCP_AUTH protects /mcp only; WEB_AUTH_PASSWORD (below) protects the web UI and /api/*.
+      - MCP_ENABLED=1
+      - MCP_AUTH=off
+      # - MCP_AUTH_TOKEN=
+      # Public URL when behind a reverse proxy; used for download links and OAuth.
+      # - PUBLIC_BASE_URL=https://ytdl.example.com
+      # Optional login for the web UI and /api/* (HTTP Basic). No auth when unset.
+      # - WEB_AUTH_PASSWORD=
+      # - WEB_AUTH_USER=admin
+
+volumes:
+  whisper-model:
